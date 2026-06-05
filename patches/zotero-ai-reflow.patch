@@ -65,12 +65,41 @@ index ad96024..cb3aec5 100755
          
          # Delete styles build script
          os.remove(os.path.join(tmp_src_dir, 'styles', 'update'))
+diff --git a/chrome/content/zotero/standalone/standalone.js b/chrome/content/zotero/standalone/standalone.js
+index a7723e9..2083ece 100644
+--- a/chrome/content/zotero/standalone/standalone.js
++++ b/chrome/content/zotero/standalone/standalone.js
+@@ -523,6 +523,11 @@ const ZoteroStandalone = new function () {
+ 			Zotero.Prefs.get('hideContextAnnotationRows')
+ 		);
+ 
++		this.updateMenuItemCheckmark(
++			'view-menuitem-ai-reflow-progress',
++			Zotero.AIReflow?.isProgressEnabled()
++		);
++
+ 		this.onUpdateCustomMenus(event, 'view');
+ 	};
+ 
+@@ -661,6 +666,12 @@ const ZoteroStandalone = new function () {
+ 			case 'hide-context-annotation-rows':
+ 				this.toggleBooleanPref('hideContextAnnotationRows');
+ 				break;
++
++			case 'ai-reflow-progress':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.setProgressEnabled(!Zotero.AIReflow.isProgressEnabled());
++				}
++				break;
+ 		}
+ 	};
+ 	
 diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
 new file mode 100644
-index 0000000..8a12e30
+index 0000000..32d46d6
 --- /dev/null
 +++ b/chrome/content/zotero/xpcom/aiReflow.js
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,464 @@
 +/*
 +    Local AI reflow bridge for PDF attachments.
 +*/
@@ -82,6 +111,58 @@ index 0000000..8a12e30
 +	this._metadataTasks = new Set();
 +	this._progressTasks = new Map();
 +
++	this.isProgressEnabled = function () {
++		try {
++			return Zotero.Prefs.get('aiReflow.showProgress') !== false;
++		}
++		catch (e) {
++			return true;
++		}
++	};
++
++	this.setProgressEnabled = function (enabled) {
++		Zotero.Prefs.set('aiReflow.showProgress', !!enabled);
++		if (!enabled) {
++			this.closeAllProgress();
++		}
++	};
++
++	this.closeProgressTask = function (docID) {
++		let task = this._progressTasks.get(docID);
++		if (!task) {
++			return;
++		}
++		task.closed = true;
++		try {
++			task.progressWin.close();
++		}
++		catch (e) {
++			Zotero.debug(`AI Reflow progress close failed: ${e}`);
++		}
++		this._progressTasks.delete(docID);
++	};
++
++	this.closeAllProgress = function () {
++		for (let docID of Array.from(this._progressTasks.keys())) {
++			this.closeProgressTask(docID);
++		}
++	};
++
++	this.scheduleProgressClose = function (docID, delay = 2500) {
++		let task = this._progressTasks.get(docID);
++		if (!task || task.closeScheduled) {
++			return;
++		}
++		task.closeScheduled = true;
++		try {
++			task.progressWin.startCloseTimer(delay);
++		}
++		catch (e) {
++			Zotero.debug(`AI Reflow progress timer failed: ${e}`);
++		}
++		Zotero.Promise.delay(delay + 500).then(() => this.closeProgressTask(docID));
++	};
++
 +	this.shouldHandleItem = function (item) {
 +		return !!(
 +			item
@@ -91,7 +172,25 @@ index 0000000..8a12e30
 +	};
 +
 +	this.getTitle = function (item, path) {
++		if (item?.parentItemID) {
++			let parentItem = Zotero.Items.get(item.parentItemID);
++			if (parentItem) {
++				return parentItem.getField('title') || item.getField('title') || PathUtils.filename(path);
++			}
++		}
 +		return item.getField('title') || PathUtils.filename(path);
++	};
++
++	this.cleanAttachmentTitle = function (item, path) {
++		let title = item.getField('title') || item.attachmentFilename || PathUtils.filename(path) || 'Untitled PDF';
++		if (title === item.attachmentFilename || title.endsWith('.pdf')) {
++			title = title.replace(/\.[^.]+$/, '');
++		}
++		return title
++			.replace(/[_]+/g, ' ')
++			.replace(/\s+-\s+\d{4}\s+-\s+/g, ' - ')
++			.replace(/\s+/g, ' ')
++			.trim() || 'Untitled PDF';
 +	};
 +
 +	this.buildURL = function (endpoint, item, path, params = {}) {
@@ -167,7 +266,36 @@ index 0000000..8a12e30
 +		return currentItem;
 +	};
 +
++	this.ensureParentItem = async function (item, options = {}) {
++		let currentItem = await this.getCurrentItem(item);
++		if (!this.shouldHandleItem(currentItem) || currentItem.parentItemID || !currentItem.isTopLevelItem()) {
++			return currentItem;
++		}
++		let title = options.title || this.cleanAttachmentTitle(currentItem, options.path);
++		try {
++			let parentItem = new Zotero.Item('document');
++			parentItem.libraryID = currentItem.libraryID;
++			parentItem.setField('title', title);
++			let collections = currentItem.getCollections();
++			if (collections.length) {
++				parentItem.setCollections(collections);
++			}
++			await Zotero.DB.executeTransaction(async () => {
++				let parentID = await parentItem.save();
++				currentItem.parentID = parentID;
++				currentItem.setField('title', 'Full Text PDF');
++				await currentItem.save();
++			});
++			Zotero.debug(`AI Reflow created fallback parent item for PDF ${currentItem.id}`);
++		}
++		catch (e) {
++			Zotero.debug(`AI Reflow fallback parent creation failed: ${e}`);
++		}
++		return this.getCurrentItem(currentItem);
++	};
++
 +	this.saveSummaryNote = async function (item, summary, savedPath) {
++		item = await this.ensureParentItem(item);
 +		let parentItem = await this.getSummaryParentItem(item);
 +		if (!parentItem || parentItem.isNote()) {
 +			return false;
@@ -254,6 +382,7 @@ index 0000000..8a12e30
 +					}
 +					currentItem = await this.getCurrentItem(item);
 +				}
++				currentItem = await this.ensureParentItem(currentItem, options);
 +				await this.queueItem(currentItem, options);
 +			}
 +			catch (e) {
@@ -267,14 +396,23 @@ index 0000000..8a12e30
 +	};
 +
 +	this.showProgressError = function (item, path, message) {
++		if (!this.isProgressEnabled()) {
++			return;
++		}
 +		try {
-+			let progressWin = new Zotero.ProgressWindow({ closeOnClick: false });
++			let progressWin = new Zotero.ProgressWindow({ closeOnClick: true });
 +			progressWin.changeHeadline('AI Reflow Background');
 +			let title = this.shortTitle(this.getTitle(item, path));
 +			let itemProgress = new progressWin.ItemProgress('attachmentPDF', `${title} - ${message}`);
 +			progressWin.show();
 +			itemProgress.setError();
 +			progressWin.startCloseTimer(10000);
++			Zotero.Promise.delay(10500).then(() => {
++				try {
++					progressWin.close();
++				}
++				catch (e) {}
++			});
 +		}
 +		catch (e) {
 +			Zotero.debug(`AI Reflow progress error failed: ${e}`);
@@ -282,57 +420,73 @@ index 0000000..8a12e30
 +	};
 +
 +	this.trackProgress = function (docID, item, path, initialStatus = {}) {
-+		if (!docID || this._progressTasks.has(docID)) {
++		if (!docID || this._progressTasks.has(docID) || !this.isProgressEnabled()) {
 +			return;
 +		}
-+		let progressWin = new Zotero.ProgressWindow({ closeOnClick: false });
++		let progressWin = new Zotero.ProgressWindow({ closeOnClick: true });
 +		progressWin.changeHeadline('AI Reflow Background');
 +		let title = this.shortTitle(this.getTitle(item, path));
 +		let itemProgress = new progressWin.ItemProgress('attachmentPDF', `${title} - queued 0%`);
 +		progressWin.show();
-+		this._progressTasks.set(docID, { progressWin, itemProgress });
++		this._progressTasks.set(docID, { progressWin, itemProgress, closed: false });
 +
 +		let update = (status) => {
++			let task = this._progressTasks.get(docID);
++			if (!task || task.closed) {
++				return false;
++			}
 +			let percent = Math.max(0, Math.min(100, Math.round(status.progress || 0)));
 +			let stage = status.stage || status.status || 'working';
 +			itemProgress.setText(`${title} - ${stage} ${percent}%`);
 +			itemProgress.setProgress(percent);
++			return true;
 +		};
 +		update(initialStatus);
++		if (initialStatus.status === 'ready') {
++			itemProgress.setText(`${title} - done 100%`);
++			itemProgress.setProgress(100);
++			this.scheduleProgressClose(docID, 2500);
++			return;
++		}
 +
 +		(async () => {
 +			try {
 +				for (let i = 0; i < 600; i++) {
 +					await this.delay(1400);
++					let task = this._progressTasks.get(docID);
++					if (!task || task.closed || !this.isProgressEnabled()) {
++						return;
++					}
 +					let status = await this.jsonRequest(
 +						`${this.baseURL}/api/status?id=${encodeURIComponent(docID)}`,
 +						{ timeout: 8000 }
 +					);
-+					update(status);
++					if (!update(status)) {
++						return;
++					}
 +					if (status.status === 'ready') {
 +						itemProgress.setText(`${title} - done 100%`);
 +						itemProgress.setProgress(100);
-+						progressWin.startCloseTimer(4000);
++						this.scheduleProgressClose(docID, 2500);
 +						return;
 +					}
 +					if (status.status === 'error') {
 +						let error = this.shortTitle(status.error || 'failed', 80);
 +						itemProgress.setText(`${title} - ${error}`);
 +						itemProgress.setError();
-+						progressWin.startCloseTimer(12000);
++						this.scheduleProgressClose(docID, 12000);
 +						return;
 +					}
 +				}
 +				itemProgress.setText(`${title} - still running`);
-+				progressWin.startCloseTimer(8000);
++				this.scheduleProgressClose(docID, 8000);
 +			}
 +			catch (e) {
-+				itemProgress.setText(`${title} - status failed`);
-+				itemProgress.setError();
-+				progressWin.startCloseTimer(10000);
-+			}
-+			finally {
-+				this._progressTasks.delete(docID);
++				if (this._progressTasks.has(docID)) {
++					itemProgress.setText(`${title} - status failed`);
++					itemProgress.setError();
++					this.scheduleProgressClose(docID, 10000);
++				}
 +			}
 +		})();
 +	};
@@ -363,10 +517,12 @@ index 0000000..8a12e30
 +		if (!this.shouldHandleItem(item)) {
 +			return false;
 +		}
++		item = await this.getCurrentItem(item);
 +		let path = options.path || await item.getFilePathAsync();
 +		if (!path) {
 +			return false;
 +		}
++		item = await this.ensureParentItem(item, { path });
 +		let url = this.buildURL('/api/ingest', item, path, {
 +			translate: options.translate === false ? '0' : '1',
 +			force: options.force ? '1' : '0'
@@ -396,10 +552,12 @@ index 0000000..8a12e30
 +		if (!this.shouldHandleItem(item)) {
 +			return false;
 +		}
++		item = await this.getCurrentItem(item);
 +		let path = options.path || await item.getFilePathAsync();
 +		if (!path) {
 +			return false;
 +		}
++		item = await this.ensureParentItem(item, { path });
 +		await this.queueItem(item, { path, timeout: 3000 });
 +		let win = Zotero.openInViewer(this.buildURL('/reflow', item, path), { allowJavaScript: true });
 +		this.maximizeViewerWindow(win);
@@ -686,6 +844,35 @@ index c8dc7ce..b46fe46 100644
  	'fileHandlers',
  	'plugins',
  	'pluginAPI/menuManager',
+diff --git a/chrome/content/zotero/zoteroPane.xhtml b/chrome/content/zotero/zoteroPane.xhtml
+index 62de138..e7b4066 100644
+--- a/chrome/content/zotero/zoteroPane.xhtml
++++ b/chrome/content/zotero/zoteroPane.xhtml
+@@ -702,6 +702,12 @@
+ 								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
+ 								type="checkbox"
+ 							/>
++							<menuitem id="view-menuitem-ai-reflow-progress"
++								class="menu-type-library"
++								label="AI Reflow 后台进度提示"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++								type="checkbox"
++							/>
+ 							<menuseparator/>
+ 							<menuitem id="show-tabs-menu"
+ 								data-l10n-id="menu-show-tabs-menu"
+diff --git a/defaults/preferences/zotero.js b/defaults/preferences/zotero.js
+index 054b7bf..3be3c55 100644
+--- a/defaults/preferences/zotero.js
++++ b/defaults/preferences/zotero.js
+@@ -39,6 +39,7 @@ pref("extensions.zotero.autoRenameFiles.fileTypes", "application/pdf,application
+ pref("extensions.zotero.autoRenameFiles.onMetadataChange", true);
+ pref("extensions.zotero.autoRenameFiles.done", true);
+ pref("extensions.zotero.autoRenameFiles.bannerShown", true);
++pref("extensions.zotero.aiReflow.showProgress", true);
+ pref("extensions.zotero.showAttachmentFilenames", false);
+ pref("extensions.zotero.capitalizeTitles", false);
+ pref("extensions.zotero.launchNonNativeFiles", false);
 diff --git a/js-build/babel-worker.js b/js-build/babel-worker.js
 index 154a4e3..0ba9a5b 100644
 --- a/js-build/babel-worker.js
