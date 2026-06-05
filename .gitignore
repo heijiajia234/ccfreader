@@ -1,0 +1,14 @@
+reflow-cache/
+reflow-service/.env
+reflow-service/node_modules/
+reflow-service/__pycache__/
+reflow-service/*.log
+tools/
+zotero-dev-profile/
+zotero-upstream/
+*.pdf
+docling_probe/
+pdf_probe_pages/
+tmp_probe_images/
+pdf_probe_*.json
+pymupdf4llm_probe.md

@@ -1,0 +1,767 @@
+diff --git a/app/scripts/prepare_build b/app/scripts/prepare_build
+index ad96024..cb3aec5 100755
+--- a/app/scripts/prepare_build
++++ b/app/scripts/prepare_build
+@@ -72,17 +72,26 @@ def main():
+         tmp_src_dir = os.path.join(tmp_dir, 'zotero')
+         
+         # Export a clean copy of the source tree
+-        subprocess.check_call([
+-            'rsync',
+-            '-aL',
+-            # Exclude hidden files
+-            '--exclude', '.*',
+-            '--exclude', '#*',
+-            '--exclude', 'package.json',
+-            '--exclude', 'package-lock.json',
+-            '.' + os.sep,
+-            tmp_src_dir + os.sep
+-        ])
++        try:
++            subprocess.check_call([
++                'rsync',
++                '-aL',
++                # Exclude hidden files
++                '--exclude', '.*',
++                '--exclude', '#*',
++                '--exclude', 'package.json',
++                '--exclude', 'package-lock.json',
++                '.' + os.sep,
++                tmp_src_dir + os.sep
++            ])
++        except FileNotFoundError:
++            def ignore_export_files(_, names):
++                return {
++                    name for name in names
++                    if name.startswith('.') or name.startswith('#')
++                    or name in ('package.json', 'package-lock.json')
++                }
++            shutil.copytree('.', tmp_src_dir, symlinks=False, ignore=ignore_export_files)
+         
+         # Make sure rsync worked
+         d = os.path.join(tmp_src_dir, 'chrome')
+@@ -90,15 +99,15 @@ def main():
+             raise FileNotFoundError(d + " not found")
+         
+         # Delete CSL locale support files
+-        subprocess.check_call([
+-            'find',
+-            os.path.normpath(tmp_src_dir + '/chrome/content/zotero/locale/csl/'),
+-            '-mindepth', '1',
+-            '!', '-name', '*.xml',
+-            '!', '-name', 'locales.json',
+-            #'-print',
+-            '-delete'
+-        ])
++        csl_locale_dir = os.path.normpath(tmp_src_dir + '/chrome/content/zotero/locale/csl/')
++        for root, dirs, files in os.walk(csl_locale_dir, topdown=False):
++            for filename in files:
++                if not filename.endswith('.xml') and filename != 'locales.json':
++                    os.remove(os.path.join(root, filename))
++            for dirname in dirs:
++                path = os.path.join(root, dirname)
++                if not dirname.endswith('.xml') and dirname != 'locales.json':
++                    shutil.rmtree(path, ignore_errors=True)
+         
+         # Delete styles build script
+         os.remove(os.path.join(tmp_src_dir, 'styles', 'update'))
+diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
+new file mode 100644
+index 0000000..8a12e30
+--- /dev/null
++++ b/chrome/content/zotero/xpcom/aiReflow.js
+@@ -0,0 +1,335 @@
++/*
++    Local AI reflow bridge for PDF attachments.
++*/
++
++Zotero.AIReflow = new function () {
++	this.baseURL = 'http://127.0.0.1:27621';
++	this.summaryNoteTitle = 'AI Reflow 论文总结';
++	this._summaryNoteTasks = new Set();
++	this._metadataTasks = new Set();
++	this._progressTasks = new Map();
++
++	this.shouldHandleItem = function (item) {
++		return !!(
++			item
++			&& item.isFileAttachment()
++			&& item.attachmentContentType === 'application/pdf'
++		);
++	};
++
++	this.getTitle = function (item, path) {
++		return item.getField('title') || PathUtils.filename(path);
++	};
++
++	this.buildURL = function (endpoint, item, path, params = {}) {
++		let query = {
++			path,
++			itemID: item.id,
++			title: this.getTitle(item, path),
++			...params
++		};
++		let pairs = [];
++		for (let [key, value] of Object.entries(query)) {
++			if (value === undefined || value === null) {
++				continue;
++			}
++			pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
++		}
++		return `${this.baseURL}${endpoint}?${pairs.join('&')}`;
++	};
++
++	this.jsonRequest = async function (url, options = {}) {
++		let response = await Zotero.HTTP.request('GET', url, {
++			timeout: options.timeout || 30000,
++			responseType: 'json'
++		});
++		if (response.response) {
++			return response.response;
++		}
++		return JSON.parse(response.responseText || '{}');
++	};
++
++	this.delay = function (ms) {
++		return new Promise(resolve => setTimeout(resolve, ms));
++	};
++
++	this.shortTitle = function (text, maxLength = 46) {
++		text = String(text || '').replace(/\s+/g, ' ').trim();
++		if (text.length <= maxLength) {
++			return text;
++		}
++		return text.slice(0, maxLength - 3) + '...';
++	};
++
++	this.escapeHTML = function (text) {
++		return String(text || '')
++			.replace(/&/g, '&amp;')
++			.replace(/</g, '&lt;')
++			.replace(/>/g, '&gt;')
++			.replace(/"/g, '&quot;');
++	};
++
++	this.summaryToNoteHTML = function (summary, savedPath) {
++		let pathHTML = savedPath
++			? `<p><strong>本地摘要文件：</strong>${this.escapeHTML(savedPath)}</p>`
++			: '';
++		return (
++			`<div data-ai-reflow-summary="1">`
++			+ `<h1>${this.summaryNoteTitle}</h1>`
++			+ pathHTML
++			+ `<pre style="white-space: pre-wrap; font-family: inherit;">${this.escapeHTML(summary)}</pre>`
++			+ `</div>`
++		);
++	};
++
++	this.getCurrentItem = async function (item) {
++		return (await Zotero.Items.getAsync(item.id)) || item;
++	};
++
++	this.getSummaryParentItem = async function (item) {
++		let currentItem = await this.getCurrentItem(item);
++		if (currentItem.parentItemID) {
++			return Zotero.Items.get(currentItem.parentItemID);
++		}
++		return currentItem;
++	};
++
++	this.saveSummaryNote = async function (item, summary, savedPath) {
++		let parentItem = await this.getSummaryParentItem(item);
++		if (!parentItem || parentItem.isNote()) {
++			return false;
++		}
++		await parentItem.loadDataType('childItems');
++		let noteHTML = this.summaryToNoteHTML(summary, savedPath);
++		let notes = Zotero.Items.get(parentItem.getNotes(true));
++		let note = notes.find(note => {
++			let content = note.getNote();
++			return content.includes('data-ai-reflow-summary="1"')
++				|| note.getNoteTitle() == this.summaryNoteTitle;
++		});
++		if (!note) {
++			note = new Zotero.Item('note');
++			note.libraryID = parentItem.libraryID;
++			note.parentID = parentItem.id;
++		}
++		note.setNote(noteHTML);
++		await note.saveTx();
++		return true;
++	};
++
++	this.queueSummaryNote = function (item, docID) {
++		let key = `${item.id}:${docID}`;
++		if (this._summaryNoteTasks.has(key)) {
++			return;
++		}
++		this._summaryNoteTasks.add(key);
++		(async () => {
++			try {
++				for (let i = 0; i < 120; i++) {
++					let url = `${this.baseURL}/api/summary?id=${encodeURIComponent(docID)}`;
++					let response;
++					try {
++						response = await this.jsonRequest(url, { timeout: 240000 });
++					}
++					catch (e) {
++						Zotero.debug(`AI Reflow summary note poll failed: ${e}`);
++						await this.delay(5000);
++						continue;
++					}
++					if (response.text) {
++						await this.saveSummaryNote(item, response.text, response.savedPath);
++						return;
++					}
++					await this.delay(5000);
++				}
++			}
++			finally {
++				this._summaryNoteTasks.delete(key);
++			}
++		})();
++	};
++
++	this.queueItemAfterMetadata = function (item, options = {}) {
++		if (!this.shouldHandleItem(item)) {
++			return false;
++		}
++		let key = String(item.id);
++		if (this._metadataTasks.has(key)) {
++			return true;
++		}
++		this._metadataTasks.add(key);
++		(async () => {
++			try {
++				await this.delay(options.metadataDelay || 1000);
++				let currentItem = await this.getCurrentItem(item);
++				if (!this.shouldHandleItem(currentItem)) {
++					return;
++				}
++				if (
++					options.recognize !== false
++					&& Zotero.RecognizeDocument
++					&& Zotero.RecognizeDocument.canRecognize(currentItem)
++				) {
++					try {
++						await Promise.race([
++							Zotero.RecognizeDocument.recognizeItems([currentItem]),
++							this.delay(options.recognizeTimeout || 120000)
++						]);
++					}
++					catch (e) {
++						Zotero.debug(`AI Reflow metadata recognition failed: ${e}`);
++					}
++					currentItem = await this.getCurrentItem(item);
++				}
++				await this.queueItem(currentItem, options);
++			}
++			catch (e) {
++				Zotero.debug(`AI Reflow metadata queue failed: ${e}`);
++			}
++			finally {
++				this._metadataTasks.delete(key);
++			}
++		})();
++		return true;
++	};
++
++	this.showProgressError = function (item, path, message) {
++		try {
++			let progressWin = new Zotero.ProgressWindow({ closeOnClick: false });
++			progressWin.changeHeadline('AI Reflow Background');
++			let title = this.shortTitle(this.getTitle(item, path));
++			let itemProgress = new progressWin.ItemProgress('attachmentPDF', `${title} - ${message}`);
++			progressWin.show();
++			itemProgress.setError();
++			progressWin.startCloseTimer(10000);
++		}
++		catch (e) {
++			Zotero.debug(`AI Reflow progress error failed: ${e}`);
++		}
++	};
++
++	this.trackProgress = function (docID, item, path, initialStatus = {}) {
++		if (!docID || this._progressTasks.has(docID)) {
++			return;
++		}
++		let progressWin = new Zotero.ProgressWindow({ closeOnClick: false });
++		progressWin.changeHeadline('AI Reflow Background');
++		let title = this.shortTitle(this.getTitle(item, path));
++		let itemProgress = new progressWin.ItemProgress('attachmentPDF', `${title} - queued 0%`);
++		progressWin.show();
++		this._progressTasks.set(docID, { progressWin, itemProgress });
++
++		let update = (status) => {
++			let percent = Math.max(0, Math.min(100, Math.round(status.progress || 0)));
++			let stage = status.stage || status.status || 'working';
++			itemProgress.setText(`${title} - ${stage} ${percent}%`);
++			itemProgress.setProgress(percent);
++		};
++		update(initialStatus);
++
++		(async () => {
++			try {
++				for (let i = 0; i < 600; i++) {
++					await this.delay(1400);
++					let status = await this.jsonRequest(
++						`${this.baseURL}/api/status?id=${encodeURIComponent(docID)}`,
++						{ timeout: 8000 }
++					);
++					update(status);
++					if (status.status === 'ready') {
++						itemProgress.setText(`${title} - done 100%`);
++						itemProgress.setProgress(100);
++						progressWin.startCloseTimer(4000);
++						return;
++					}
++					if (status.status === 'error') {
++						let error = this.shortTitle(status.error || 'failed', 80);
++						itemProgress.setText(`${title} - ${error}`);
++						itemProgress.setError();
++						progressWin.startCloseTimer(12000);
++						return;
++					}
++				}
++				itemProgress.setText(`${title} - still running`);
++				progressWin.startCloseTimer(8000);
++			}
++			catch (e) {
++				itemProgress.setText(`${title} - status failed`);
++				itemProgress.setError();
++				progressWin.startCloseTimer(10000);
++			}
++			finally {
++				this._progressTasks.delete(docID);
++			}
++		})();
++	};
++
++	this.maximizeViewerWindow = function (win) {
++		if (!win) {
++			return;
++		}
++		let maximize = () => {
++			try {
++				win.moveTo(0, 0);
++				win.resizeTo(win.screen.availWidth, win.screen.availHeight);
++				win.maximize();
++				win.focus();
++			}
++			catch (e) {
++				Zotero.debug(`AI Reflow could not maximize viewer: ${e}`);
++			}
++		};
++		try {
++			win.addEventListener('load', () => win.setTimeout(maximize, 0), { once: true });
++		}
++		catch (e) {}
++		win.setTimeout(maximize, 250);
++	};
++
++	this.queueItem = async function (item, options = {}) {
++		if (!this.shouldHandleItem(item)) {
++			return false;
++		}
++		let path = options.path || await item.getFilePathAsync();
++		if (!path) {
++			return false;
++		}
++		let url = this.buildURL('/api/ingest', item, path, {
++			translate: options.translate === false ? '0' : '1',
++			force: options.force ? '1' : '0'
++		});
++		try {
++			let response = await this.jsonRequest(url, {
++				timeout: options.timeout || 15000,
++			});
++			if (response.id && options.showProgress !== false) {
++				this.trackProgress(response.id, item, path, response);
++			}
++			if (response.id && options.summaryNote !== false) {
++				this.queueSummaryNote(item, response.id);
++			}
++			return true;
++		}
++		catch (e) {
++			Zotero.debug(`AI Reflow service unavailable for ${path}: ${e}`);
++			if (options.showProgress !== false) {
++				this.showProgressError(item, path, 'service unavailable');
++			}
++			return false;
++		}
++	};
++
++	this.openItem = async function (item, options = {}) {
++		if (!this.shouldHandleItem(item)) {
++			return false;
++		}
++		let path = options.path || await item.getFilePathAsync();
++		if (!path) {
++			return false;
++		}
++		await this.queueItem(item, { path, timeout: 3000 });
++		let win = Zotero.openInViewer(this.buildURL('/reflow', item, path), { allowJavaScript: true });
++		this.maximizeViewerWindow(win);
++		return true;
++	};
++};
+diff --git a/chrome/content/zotero/xpcom/attachments.js b/chrome/content/zotero/xpcom/attachments.js
+index 54e3939..8daa5d3 100644
+--- a/chrome/content/zotero/xpcom/attachments.js
++++ b/chrome/content/zotero/xpcom/attachments.js
+@@ -726,6 +726,9 @@ Zotero.Attachments = new function () {
+ 		}
+ 		
+ 		await Zotero.FullText.queueItem(attachmentItem);
++		if (Zotero.AIReflow?.queueItemAfterMetadata) {
++			Zotero.AIReflow.queueItemAfterMetadata(attachmentItem);
++		}
+ 		
+ 		return attachmentItem;
+ 	};
+@@ -950,6 +953,9 @@ Zotero.Attachments = new function () {
+ 			}.bind(this));
+ 			
+ 			await Zotero.FullText.queueItem(attachmentItem);
++			if (Zotero.AIReflow?.queueItemAfterMetadata) {
++				Zotero.AIReflow.queueItemAfterMetadata(attachmentItem);
++			}
+ 		}
+ 		catch (e) {
+ 			Zotero.debug(e, 1);
+@@ -1134,6 +1140,9 @@ Zotero.Attachments = new function () {
+ 			await OS.File.move(tmpDirectory, destDirectory);
+ 			
+ 			await Zotero.FullText.queueItem(attachmentItem);
++			if (Zotero.AIReflow?.queueItemAfterMetadata) {
++				Zotero.AIReflow.queueItemAfterMetadata(attachmentItem);
++			}
+ 		}
+ 		catch (e) {
+ 			Zotero.debug(e, 1);
+@@ -3308,7 +3317,10 @@ Zotero.Attachments = new function () {
+ 	 * @return {Promise}
+ 	 */
+ 	var _postProcessFile = async function (item) {
+-		return Zotero.Fulltext.indexItems([item.id]);
++		await Zotero.Fulltext.indexItems([item.id]);
++		if (Zotero.AIReflow?.queueItemAfterMetadata && Zotero.AIReflow.shouldHandleItem(item)) {
++			Zotero.AIReflow.queueItemAfterMetadata(item);
++		}
+ 	};
+ 	
+ 	
+diff --git a/chrome/content/zotero/xpcom/fileHandlers.js b/chrome/content/zotero/xpcom/fileHandlers.js
+index 5a9bc28..0a2f2f8 100644
+--- a/chrome/content/zotero/xpcom/fileHandlers.js
++++ b/chrome/content/zotero/xpcom/fileHandlers.js
+@@ -37,6 +37,10 @@ Zotero.FileHandlers = {
+ 		
+ 		Zotero.debug('Opening ' + path);
+ 		
++		if (Zotero.AIReflow && Zotero.AIReflow.shouldHandleItem(item)) {
++			return Zotero.AIReflow.openItem(item, { path });
++		}
++		
+ 		let readerType = item.attachmentReaderType;
+ 		
+ 		// Not a file that we/external readers handle with page number support -
+diff --git a/chrome/content/zotero/xpcom/reader.js b/chrome/content/zotero/xpcom/reader.js
+index b4cecf3..c923090 100644
+--- a/chrome/content/zotero/xpcom/reader.js
++++ b/chrome/content/zotero/xpcom/reader.js
+@@ -2736,6 +2736,13 @@ class Reader {
+ 		if (!item) {
+ 			throw new Error('Item does not exist');
+ 		}
++		if (Zotero.AIReflow && Zotero.AIReflow.shouldHandleItem(item)) {
++			await Zotero.AIReflow.openItem(item);
++			if (tabID && win) {
++				win.Zotero_Tabs.close(tabID);
++			}
++			return { _initPromise: Promise.resolve() };
++		}
+ 
+ 		this._loadSidebarState();
+ 		this.triggerAnnotationsImportCheck(itemID);
+diff --git a/chrome/content/zotero/xpcom/recognizeDocument.js b/chrome/content/zotero/xpcom/recognizeDocument.js
+index 52cbc4a..469ab9c 100644
+--- a/chrome/content/zotero/xpcom/recognizeDocument.js
++++ b/chrome/content/zotero/xpcom/recognizeDocument.js
+@@ -386,6 +386,23 @@ Zotero.RecognizeDocument = new function () {
+ 		);
+ 		return JSON.parse(req.responseText);
+ 	}
++
++	function _getLocalRecognizerResult(json) {
++		let parts = [json.fileName || ''];
++		for (let page of (json.pages || []).slice(0, MAX_PAGES)) {
++			parts.push(JSON.stringify(page[2] || ''));
++		}
++		let identifiers = Zotero.Utilities.extractIdentifiers(parts.join('\n'));
++		let identifier = identifiers.find(x => x.DOI || x.arXiv || x.ISBN);
++		if (!identifier) {
++			return null;
++		}
++		return {
++			doi: identifier.DOI,
++			arxiv: identifier.arXiv,
++			isbn: identifier.ISBN
++		};
++	}
+ 	
+ 	/**
+ 	 * Retrieves metadata for a PDF or EPUB and saves it as an item
+@@ -426,7 +443,13 @@ Zotero.RecognizeDocument = new function () {
+ 		
+ 		let libraryID = item.libraryID;
+ 		
+-		let res = await _query(json);
++		let res = _getLocalRecognizerResult(json);
++		if (res) {
++			Zotero.debug('RecognizeDocument: Using locally extracted PDF identifier');
++		}
++		else {
++			res = await _query(json);
++		}
+ 		if (!res) return null;
+ 		
+ 		if (res.arxiv) {
+diff --git a/chrome/content/zotero/xpcom/streamer.js b/chrome/content/zotero/xpcom/streamer.js
+index 63278a9..761be9d 100644
+--- a/chrome/content/zotero/xpcom/streamer.js
++++ b/chrome/content/zotero/xpcom/streamer.js
+@@ -217,10 +217,8 @@ Zotero.Streamer_Module.prototype = {
+ 	
+ 	
+ 	_isEnabled: function () {
+-		return Zotero.Prefs.get('streaming.enabled')
+-			// Only connect if either auto-sync or automatic style/translator updates are enabled
+-			&& ((Zotero.Prefs.get('sync.autoSync') && Zotero.Sync.Runner.enabled)
+-				|| Zotero.Prefs.get('automaticScraperUpdates'));
++		// Local reflow build: don't connect to Zotero's hosted streaming service.
++		return false;
+ 	},
+ 	
+ 	
+diff --git a/chrome/content/zotero/xpcom/style.js b/chrome/content/zotero/xpcom/style.js
+index 83e9a53..8a01e7c 100644
+--- a/chrome/content/zotero/xpcom/style.js
++++ b/chrome/content/zotero/xpcom/style.js
+@@ -116,13 +116,8 @@ Zotero.Styles = new function () {
+ 			let newID = prefix + _renamedStyles[oldName];
+ 			if (_styles[oldID] && _styles[newID]) {
+ 				Zotero.debug("Deleting renamed style '" + oldID + "'");
+-				try {
+-					await OS.File.remove(_styles[oldID].path);
+-					delete _styles[oldID];
+-				}
+-				catch (e) {
+-					Zotero.logError(e);
+-				}
++				await _removeStyleFile(_styles[oldID].path, { ignoreAccessDenied: true });
++				delete _styles[oldID];
+ 			}
+ 		}
+ 		_visibleStyles = _visibleStyles.filter(s => _styles[s.styleID]);
+@@ -225,6 +220,39 @@ Zotero.Styles = new function () {
+ 		}
+ 		return numCached;
+ 	};
++
++	var _isFileAccessDeniedError = function (e) {
++		return e && (
++			e.name == 'NotAllowedError'
++			|| e.name == 'ReadOnlyError'
++			|| e.becauseAccessDenied
++			|| String(e).includes('NS_ERROR_FILE_ACCESS_DENIED')
++			|| String(e).includes('ACCESS_DENIED')
++		);
++	};
++
++	var _removeStyleFile = async function (file, options = {}) {
++		let path = typeof file == 'string' ? file : file.path;
++		try {
++			await Zotero.File.setNormalFilePermissions(path);
++		}
++		catch (e) {
++			if (!_isFileAccessDeniedError(e)) {
++				Zotero.debug(e, 1);
++			}
++		}
++		try {
++			await OS.File.remove(path);
++			return true;
++		}
++		catch (e) {
++			if (options.ignoreAccessDenied && _isFileAccessDeniedError(e)) {
++				Zotero.debug(`Could not remove locked style file '${path}'; ignoring in local build`, 1);
++				return false;
++			}
++			throw e;
++		}
++	};
+ 	
+ 	/**
+ 	 * Gets a style with a given ID
+@@ -512,7 +540,7 @@ Zotero.Styles = new function () {
+ 		// continue
+ 		
+ 		// Remove any existing file with a different name
+-		if(existingFile) existingFile.remove(false);
++		if (existingFile) await _removeStyleFile(existingFile);
+ 		
+ 		await Zotero.File.putContentsAsync(destFile, style);
+ 		
+@@ -1019,10 +1047,11 @@ Zotero.Style.prototype.remove = async function () {
+ 		// copy dependent styles to hidden directory
+ 		let hiddenDir = OS.Path.join(Zotero.getStylesDirectory().path, 'hidden');
+ 		await Zotero.File.createDirectoryIfMissingAsync(hiddenDir);
++		await Zotero.File.setNormalFilePermissions(this.path);
+ 		await OS.File.move(this.path, OS.Path.join(hiddenDir, PathUtils.filename(this.path)));
+ 	} else {
+ 		// remove defunct files
+-		await OS.File.remove(this.path);
++		await _removeStyleFile(this.path);
+ 	}
+ 	
+ 	// check to see if this style depended on a hidden one
+diff --git a/chrome/content/zotero/xpcom/zotero.js b/chrome/content/zotero/xpcom/zotero.js
+index e6c17ba..3325ca2 100644
+--- a/chrome/content/zotero/xpcom/zotero.js
++++ b/chrome/content/zotero/xpcom/zotero.js
+@@ -1034,13 +1034,41 @@ const { CommandLineOptions } = ChromeUtils.importESModule("chrome://zotero/conte
+ 		if (!_tmpDir) return;
+ 		try {
+ 			Zotero.debug("Removing " + _tmpDir);
+-			return IOUtils.remove(_tmpDir, { recursive: true });
++			if (Zotero.isWin) {
++				await clearWindowsTempAttributes(_tmpDir);
++			}
++			return IOUtils.remove(_tmpDir, { recursive: true, ignoreAbsent: true });
+ 		}
+ 		catch (e) {
++			if (e.name === 'NotAllowedError' || e.message?.includes('NS_ERROR_FILE_ACCESS_DENIED')) {
++				Zotero.debug(`Could not remove temp directory ${_tmpDir}: ${e}`);
++				return;
++			}
+ 			Zotero.logError(e);
+ 		}
+ 	}
+ 	
++	async function clearWindowsTempAttributes(path) {
++		try {
++			let info = await IOUtils.stat(path);
++			if (info.type === 'directory') {
++				for (let child of await IOUtils.getChildren(path)) {
++					await clearWindowsTempAttributes(child);
++				}
++			}
++			await IOUtils.setWindowsAttributes(path, {
++				readOnly: false,
++				hidden: false,
++				system: false
++			});
++		}
++		catch (e) {
++			if (e.name !== 'NotFoundError') {
++				Zotero.debug(`Could not normalize temp file attributes for ${path}: ${e}`);
++			}
++		}
++	}
++	
+ 	
+ 	this.openMainWindow = function () {
+ 		var chromeURI = AppConstants.BROWSER_CHROME_URL;
+diff --git a/chrome/content/zotero/zotero.mjs b/chrome/content/zotero/zotero.mjs
+index c8dc7ce..b46fe46 100644
+--- a/chrome/content/zotero/zotero.mjs
++++ b/chrome/content/zotero/zotero.mjs
+@@ -112,6 +112,7 @@ const xpcomFilesLocal = [
+ 	'locateManager',
+ 	'mime',
+ 	'notifier',
++	'aiReflow',
+ 	'fileHandlers',
+ 	'plugins',
+ 	'pluginAPI/menuManager',
+diff --git a/js-build/babel-worker.js b/js-build/babel-worker.js
+index 154a4e3..0ba9a5b 100644
+--- a/js-build/babel-worker.js
++++ b/js-build/babel-worker.js
+@@ -9,6 +9,18 @@ const options = JSON.parse(fs.readFileSync('.babelrc'));
+ const cluster = require('cluster');
+ const { comparePaths } = require('./utils');
+ 
++async function readSource(sourcefile) {
++	let contents = await fs.readFile(sourcefile, 'utf8');
++	if (contents.length < 500 && /^(\.\.\/|node_modules\/)/.test(contents.trim())) {
++		const resolvedTarget = path.resolve(path.dirname(sourcefile), contents.trim());
++		try {
++			await fs.access(resolvedTarget, fs.constants.F_OK);
++			contents = await fs.readFile(resolvedTarget, 'utf8');
++		} catch (_) {}
++	}
++	return contents;
++}
++
+ /* exported onmessage */
+ async function babelWorker(ev) {
+ 	const t1 = Date.now();
+@@ -29,7 +41,7 @@ async function babelWorker(ev) {
+ 	var transformed;
+ 
+ 	try {
+-		let contents = await fs.readFile(sourcefile, 'utf8');
++		let contents = await readSource(sourcefile);
+ 		// Patch react-virtualized
+ 		if (comparePaths(sourcefile, 'resource/react-virtualized.js')) {
+ 			transformed = contents.replace('scrollDiv = document.createElement("div")', 'scrollDiv = document.createElementNS("http://www.w3.org/1999/xhtml", "div")')
+diff --git a/js-build/symlinks.js b/js-build/symlinks.js
+index 2c2496c..4a99c5a 100644
+--- a/js-build/symlinks.js
++++ b/js-build/symlinks.js
+@@ -8,6 +8,26 @@ const { isWindows, formatDirsForMatcher, getSignatures, writeSignatures, cleanUp
+ const { dirs, symlinkDirs, copyDirs, symlinkFiles, ignoreMask } = require('./config');
+ const ROOT = path.resolve(__dirname, '..');
+ 
++async function resolveWindowsSymlinkFile(f) {
++	const source = path.join(ROOT, f);
++	const stat = await fs.stat(source);
++	if (!stat.isFile() || stat.size > 500) {
++		return f;
++	}
++
++	const linkTarget = (await fs.readFile(source, 'utf8')).trim();
++	if (!/^(\.\.\/|node_modules\/)/.test(linkTarget)) {
++		return f;
++	}
++
++	const resolvedTarget = path.resolve(path.dirname(source), linkTarget);
++	try {
++		await fs.access(resolvedTarget, fs.constants.F_OK);
++		return resolvedTarget;
++	} catch (_) {
++		return f;
++	}
++}
+ 
+ //@TODO: change signature to getSymlinks(source, options, signatures)
+ //		 here and elsewhere
+@@ -38,7 +58,7 @@ async function getSymlinks(source, options, signatures) {
+ 		const dest = path.join('build', f);
+ 		try {
+ 			if (isWindows) {
+-				await fs.copy(f, dest, { dereference: true });
++				await fs.copy(await resolveWindowsSymlinkFile(f), dest, { dereference: true });
+ 			} else {
+ 				await fs.ensureSymlink(f, dest);
+ 			}
+@@ -86,4 +106,4 @@ if (require.main === module) {
+ 			onError(err);
+ 		}
+ 	})();
+-}
+\ No newline at end of file
++}
