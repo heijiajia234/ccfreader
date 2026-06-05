@@ -1,3 +1,62 @@
+diff --git a/app/assets/application.ini b/app/assets/application.ini
+index 802d2f6..623ecf4 100644
+--- a/app/assets/application.ini
++++ b/app/assets/application.ini
+@@ -1,6 +1,6 @@
+ [App]
+-Vendor=Zotero
+-Name=Zotero
++Vendor=SciReader
++Name=SciReader
+ Version={{VERSION}}
+ BuildID={{BUILDID}}
+ Copyright=Copyright (c) 2006-2025 Contributors
+@@ -15,4 +15,4 @@ EnableExtensionManager=1
+ EnableProfileMigrator=1
+ 
+ [AppUpdate]
+-URL=https://www.zotero.org/download/client/update/%VERSION%/%BUILD_ID%/%BUILD_TARGET%/%LOCALE%/%CHANNEL%/%OS_VERSION%/update.xml
++URL=
+diff --git a/app/assets/branding/locale/brand.dtd b/app/assets/branding/locale/brand.dtd
+index cba785b..b93cb62 100644
+--- a/app/assets/branding/locale/brand.dtd
++++ b/app/assets/branding/locale/brand.dtd
+@@ -1 +1,2 @@
+-﻿<!ENTITY  brandShortName        "Zotero">
++﻿<!ENTITY  brandShortName        "SciReader">
++
+diff --git a/app/assets/branding/locale/brand.ftl b/app/assets/branding/locale/brand.ftl
+index 477266b..8907b81 100644
+--- a/app/assets/branding/locale/brand.ftl
++++ b/app/assets/branding/locale/brand.ftl
+@@ -1,8 +1,8 @@
+--brand-shorter-name = Zotero
+--brand-short-name = Zotero
+--brand-full-name = Zotero
+--brand-product-name = Zotero
+--vendor-short-name = Zotero
+--app-name = Zotero
+--subscription-name = Zotero Storage
+-trademarkInfo = Zotero is a trademark of the Corporation for Digital Scholarship.
++-brand-shorter-name = SciReader
++-brand-short-name = SciReader
++-brand-full-name = SciReader
++-brand-product-name = SciReader
++-vendor-short-name = SciReader
++-app-name = SciReader
++-subscription-name = SciReader WebDAV
++trademarkInfo = SciReader is a local academic reader.
+diff --git a/app/assets/branding/locale/brand.properties b/app/assets/branding/locale/brand.properties
+index 5adb572..221ff00 100644
+--- a/app/assets/branding/locale/brand.properties
++++ b/app/assets/branding/locale/brand.properties
+@@ -1,3 +1,3 @@
+-brandShorterName=Zotero
+-brandShortName=Zotero
+-brandFullName=Zotero
++brandShorterName=SciReader
++brandShortName=SciReader
++brandFullName=SciReader
 diff --git a/app/scripts/prepare_build b/app/scripts/prepare_build
 index ad96024..cb3aec5 100755
 --- a/app/scripts/prepare_build
@@ -66,7 +125,7 @@ index ad96024..cb3aec5 100755
          # Delete styles build script
          os.remove(os.path.join(tmp_src_dir, 'styles', 'update'))
 diff --git a/chrome/content/zotero/standalone/standalone.js b/chrome/content/zotero/standalone/standalone.js
-index a7723e9..f90f17f 100644
+index a7723e9..8a74e95 100644
 --- a/chrome/content/zotero/standalone/standalone.js
 +++ b/chrome/content/zotero/standalone/standalone.js
 @@ -523,6 +523,11 @@ const ZoteroStandalone = new function () {
@@ -81,7 +140,7 @@ index a7723e9..f90f17f 100644
  		this.onUpdateCustomMenus(event, 'view');
  	};
  
-@@ -661,6 +666,18 @@ const ZoteroStandalone = new function () {
+@@ -661,6 +666,30 @@ const ZoteroStandalone = new function () {
  			case 'hide-context-annotation-rows':
  				this.toggleBooleanPref('hideContextAnnotationRows');
  				break;
@@ -94,7 +153,19 @@ index a7723e9..f90f17f 100644
 +
 +			case 'ai-reflow-keys':
 +				if (Zotero.AIReflow) {
-+					Zotero.AIReflow.configureKeys();
++					Zotero.AIReflow.configureSettings();
++				}
++				break;
++
++			case 'ai-reflow-stars':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.promptSetStars();
++				}
++				break;
++
++			case 'ai-reflow-sync':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.syncLibrary();
 +				}
 +				break;
  		}
@@ -102,19 +173,19 @@ index a7723e9..f90f17f 100644
  	
 diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
 new file mode 100644
-index 0000000..abdce8b
+index 0000000..00060f5
 --- /dev/null
 +++ b/chrome/content/zotero/xpcom/aiReflow.js
-@@ -0,0 +1,960 @@
+@@ -0,0 +1,1235 @@
 +/*
-+    Local AI reflow bridge for PDF attachments.
++    Local SciReader bridge for PDF attachments.
 +*/
 +
 +Zotero.AIReflow = new function () {
 +	this.baseURL = 'http://127.0.0.1:27621';
-+	this.columnPluginID = 'ai-reflow@local';
-+	this.aiExtraKeys = ['Venue', 'CCF', 'SCI', 'JCR', 'RankScore', 'Stars', 'Evidence'];
-+	this.summaryNoteTitle = 'AI Reflow 论文总结';
++	this.columnPluginID = 'scireader@local';
++	this.aiExtraKeys = ['Venue', 'CCF', 'SCI', 'JCR', 'RankScore', 'Stars', 'CodeStatus', 'CodeURL', 'CodeEvidence', 'Evidence'];
++	this.summaryNoteTitle = 'SciReader 论文总结';
 +	this._summaryNoteTasks = new Set();
 +	this._metadataTasks = new Set();
 +	this._metadataSyncTasks = new Set();
@@ -137,13 +208,37 @@ index 0000000..abdce8b
 +		}
 +	};
 +
-+	this.configureKeys = async function () {
++	this.disableNativeCloudSync = function () {
++		for (let [key, value] of [
++			['streaming.enabled', false],
++			['sync.autoSync', false],
++			['sync.storage.enabled', false],
++			['sync.reminder.setUp.enabled', false],
++			['sync.reminder.autoSync.enabled', false],
++			['automaticScraperUpdates', false]
++		]) {
++			try {
++				Zotero.Prefs.set(key, value);
++			}
++			catch (e) {}
++		}
++	};
++
++	this.configureSettings = async function () {
++		let status = {};
++		try {
++			status = await this.jsonRequest(`${this.baseURL}/api/config`, { timeout: 10000 });
++		}
++		catch (e) {}
 +		let deepseek = { value: '' };
 +		let easyscholar = { value: '' };
++		let webdavURL = { value: status.webdavUrl || 'https://dav.jianguoyun.com/dav/' };
++		let webdavUser = { value: status.webdavUser || '' };
++		let webdavPassword = { value: '' };
 +		let check = { value: false };
 +		let ok = Services.prompt.promptPassword(
 +			null,
-+			'AI Reflow DeepSeek Key',
++			'SciReader DeepSeek Key',
 +			'输入新的 DeepSeek API Key（留空则不修改）：',
 +			deepseek,
 +			'',
@@ -154,9 +249,42 @@ index 0000000..abdce8b
 +		}
 +		ok = Services.prompt.promptPassword(
 +			null,
-+			'AI Reflow easyScholar Key',
++			'SciReader easyScholar Key',
 +			'输入新的 easyScholar SecretKey（留空则不修改）：',
 +			easyscholar,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.prompt(
++			null,
++			'SciReader WebDAV',
++			'WebDAV 服务器地址：',
++			webdavURL,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.prompt(
++			null,
++			'SciReader WebDAV',
++			'WebDAV 账号：',
++			webdavUser,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.promptPassword(
++			null,
++			'SciReader WebDAV',
++			'WebDAV 应用密码（留空则不修改）：',
++			webdavPassword,
 +			'',
 +			check
 +		);
@@ -166,16 +294,22 @@ index 0000000..abdce8b
 +		try {
 +			let response = await this.postJSON('/api/config', {
 +				deepseekKey: deepseek.value,
-+				easyScholarKey: easyscholar.value
++				easyScholarKey: easyscholar.value,
++				webdavUrl: webdavURL.value,
++				webdavUser: webdavUser.value,
++				webdavPassword: webdavPassword.value
 +			}, { timeout: 20000 });
 +			let message = `DeepSeek：${response.deepseekConfigured ? '已配置' : '未配置'}\n`
-+				+ `easyScholar：${response.easyScholarConfigured ? '已配置' : '未配置'}`;
-+			Services.prompt.alert(null, 'AI Reflow 接口设置', message);
++				+ `easyScholar：${response.easyScholarConfigured ? '已配置' : '未配置'}\n`
++				+ `WebDAV：${response.webdavConfigured ? '已配置' : '未配置'}`;
++			Services.prompt.alert(null, 'SciReader 设置', message);
 +		}
 +		catch (e) {
-+			Services.prompt.alert(null, 'AI Reflow 接口设置失败', String(e));
++			Services.prompt.alert(null, 'SciReader 设置失败', String(e));
 +		}
 +	};
++
++	this.configureKeys = this.configureSettings;
 +
 +	this.closeProgressTask = function (docID) {
 +		let task = this._progressTasks.get(docID);
@@ -347,7 +481,7 @@ index 0000000..abdce8b
 +		}
 +		let extra = item.getField('extra') || '';
 +		for (let line of extra.split(/\r?\n/)) {
-+			let match = line.match(/^AI Reflow (Venue|CCF|SCI|JCR|RankScore|Stars|Evidence):\s*(.*)$/);
++			let match = line.match(/^(?:AI Reflow|SciReader) (Venue|CCF|SCI|JCR|RankScore|Stars|CodeStatus|CodeURL|CodeEvidence|Evidence):\s*(.*)$/);
 +			if (match) {
 +				data[match[1]] = match[2].trim();
 +			}
@@ -361,7 +495,7 @@ index 0000000..abdce8b
 +		let extra = item.getField('extra') || '';
 +		let lines = extra
 +			.split(/\r?\n/)
-+			.filter(line => !/^AI Reflow (Venue|CCF|SCI|JCR|RankScore|Stars|Evidence):/.test(line));
++			.filter(line => !/^(?:AI Reflow|SciReader) (Venue|CCF|SCI|JCR|RankScore|Stars|CodeStatus|CodeURL|CodeEvidence|Evidence):/.test(line));
 +		while (lines.length && !lines[lines.length - 1].trim()) {
 +			lines.pop();
 +		}
@@ -371,7 +505,7 @@ index 0000000..abdce8b
 +		for (let key of this.aiExtraKeys) {
 +			let value = merged[key];
 +			if (value !== undefined && value !== null && String(value).trim() !== '') {
-+				lines.push(`AI Reflow ${key}: ${String(value).replace(/\s+/g, ' ').trim()}`);
++				lines.push(`SciReader ${key}: ${String(value).replace(/\s+/g, ' ').trim()}`);
 +			}
 +		}
 +		item.setField('extra', lines.join('\n'));
@@ -384,22 +518,12 @@ index 0000000..abdce8b
 +		if (meta.RankScore !== undefined && meta.RankScore !== '') {
 +			let parsed = parseInt(meta.RankScore, 10);
 +			if (!isNaN(parsed)) {
-+				return Math.max(0, Math.min(4, parsed));
++				return Math.max(0, Math.min(7, parsed));
 +			}
 +		}
-+		if (ccf === 'A' || sci === 'Q1' || jcr === 'Q1') {
-+			return 4;
-+		}
-+		if (ccf === 'B' || sci === 'Q2' || jcr === 'Q2') {
-+			return 3;
-+		}
-+		if (ccf === 'C' || sci === 'Q3' || jcr === 'Q3') {
-+			return 2;
-+		}
-+		if (sci === 'Q4' || jcr === 'Q4') {
-+			return 1;
-+		}
-+		return 0;
++		let ccfScore = { A: 3, B: 2, C: 1 }[ccf] || 0;
++		let quartileScore = { Q1: 4, Q2: 3, Q3: 2, Q4: 1 };
++		return ccfScore + Math.max(quartileScore[sci] || 0, quartileScore[jcr] || 0);
 +	};
 +
 +	this.normalizeStars = function (stars) {
@@ -408,6 +532,20 @@ index 0000000..abdce8b
 +			value = 0;
 +		}
 +		return Math.max(0, Math.min(5, value));
++	};
++
++	this.sortCellData = function (score, display) {
++		score = parseInt(score, 10);
++		if (isNaN(score)) {
++			score = 0;
++		}
++		return `${String(Math.max(0, score)).padStart(4, '0')}|${display || ''}`;
++	};
++
++	this.displayCellData = function (data) {
++		data = String(data || '');
++		let match = data.match(/^\d{4}\|(.*)$/s);
++		return match ? match[1] : data;
 +	};
 +
 +	this.summaryToNoteHTML = function (summary, savedPath) {
@@ -525,6 +663,9 @@ index 0000000..abdce8b
 +				SCI: response.sci,
 +				JCR: response.jcr
 +			})),
++			CodeStatus: response.codeStatus || '未知',
++			CodeURL: response.codeUrl || '',
++			CodeEvidence: response.codeEvidence || '',
 +			Evidence: response.evidence || ''
 +		};
 +		let oldExtra = parentItem.getField('extra') || '';
@@ -795,14 +936,14 @@ index 0000000..abdce8b
 +			return '';
 +		}
 +		let score = this.rankScore(data);
-+		let grade = ['未知', 'D档', 'C档', 'B档', 'A档'][score] || '未知';
-+		return [
++		let grade = score >= 6 ? 'A档' : score >= 4 ? 'B档' : score >= 2 ? 'C档' : score >= 1 ? 'D档' : '未知';
++		return this.sortCellData(score, [
 +			grade,
 +			data.Venue || '未知',
 +			data.CCF || '未知',
 +			data.SCI || '未知',
 +			data.JCR || '未知'
-+		].join('\t');
++		].join('\t'));
 +	};
 +
 +	this.starsColumnData = function (item) {
@@ -812,12 +953,33 @@ index 0000000..abdce8b
 +		}
 +		let data = this.parseAIExtra(target);
 +		let stars = this.normalizeStars(data.Stars);
-+		return `${stars}星 ${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}`;
++		return this.sortCellData(stars, `${stars}星 ${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}`);
++	};
++
++	this.codeColumnData = function (item) {
++		let target = this.getColumnItem(item);
++		if (!target || target.id !== item.id) {
++			return '';
++		}
++		let data = this.parseAIExtra(target);
++		let status = data.CodeStatus || '未知';
++		let score = status === '开源' ? 3 : /疑似|待验证/.test(status) ? 2 : status === '未开源' ? 1 : 0;
++		return this.sortCellData(score, [
++			status,
++			data.CodeURL || '',
++			data.CodeEvidence || ''
++		].join('\t'));
 +	};
 +
 +	this.badgeStyle = function (label) {
 +		label = String(label || '').toUpperCase();
-+		if (/A档|CCF-A|Q1/.test(label)) {
++		if (/疑似|待验证/.test(label)) {
++			return { background: '#facc15', color: '#1f2937' };
++		}
++		if (/未开源|D档|Q4/.test(label)) {
++			return { background: '#94a3b8', color: '#fff' };
++		}
++		if (/A档|CCF-A|Q1/.test(label) || label === '开源') {
 +			return { background: '#dc2626', color: '#fff' };
 +		}
 +		if (/B档|CCF-B|Q2/.test(label)) {
@@ -853,6 +1015,7 @@ index 0000000..abdce8b
 +		let cell = doc.createElement('span');
 +		cell.className = `cell ${column.className}`;
 +		cell.style.cssText = 'display:flex;align-items:center;gap:5px;min-width:0;overflow:hidden;';
++		data = this.displayCellData(data);
 +		if (!data) {
 +			return cell;
 +		}
@@ -880,6 +1043,48 @@ index 0000000..abdce8b
 +		return cell;
 +	};
 +
++	this.renderCodeCell = function (index, data, column, doc = document) {
++		let cell = doc.createElement('span');
++		cell.className = `cell ${column.className}`;
++		cell.style.cssText = 'display:flex;align-items:center;gap:5px;min-width:0;overflow:hidden;';
++		data = this.displayCellData(data);
++		if (!data) {
++			return cell;
++		}
++		let [status, url, evidence] = data.split('\t');
++		status = status || '未知';
++		cell.append(this.makeBadge(status, doc));
++		if (url) {
++			let link = doc.createElement('span');
++			link.textContent = this.shortTitle(url.replace(/^https?:\/\//, ''), 34);
++			link.title = evidence || url;
++			link.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#2563eb;cursor:pointer;';
++			let openedAt = 0;
++			let open = (event) => {
++				event.preventDefault();
++				event.stopPropagation();
++				if (event.stopImmediatePropagation) {
++					event.stopImmediatePropagation();
++				}
++				let now = Date.now();
++				if (now - openedAt < 400) {
++					return;
++				}
++				openedAt = now;
++				try {
++					Zotero.launchURL(url);
++				}
++				catch (e) {
++					Zotero.debug(`SciReader open code URL failed: ${e}`);
++				}
++			};
++			link.addEventListener('mousedown', open, true);
++			link.addEventListener('click', open, true);
++			cell.append(link);
++		}
++		return cell;
++	};
++
 +	this.setStars = async function (itemID, stars) {
 +		let item = Zotero.Items.get(parseInt(itemID, 10));
 +		if (!item) {
@@ -894,10 +1099,121 @@ index 0000000..abdce8b
 +		catch (e) {}
 +	};
 +
++	this.getSelectedColumnItems = function () {
++		let pane = Zotero.getActiveZoteroPane?.() || ZoteroPane;
++		let selected = [];
++		try {
++			selected = pane.getSelectedItems?.() || [];
++		}
++		catch (e) {}
++		let targets = [];
++		let seen = new Set();
++		for (let item of selected) {
++			let target = this.getColumnItem(item) || item;
++			if (!target || seen.has(target.id)) {
++				continue;
++			}
++			seen.add(target.id);
++			targets.push(target);
++		}
++		return targets;
++	};
++
++	this.promptSetStars = async function () {
++		let targets = this.getSelectedColumnItems();
++		if (!targets.length) {
++			Services.prompt.alert(null, 'SciReader 重要性', '请先选中一篇论文或 PDF。');
++			return;
++		}
++		let input = { value: '3' };
++		let check = { value: false };
++		let ok = Services.prompt.prompt(
++			null,
++			'SciReader 重要性',
++			'输入重要性星级（0-5）：',
++			input,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		let stars = this.normalizeStars(input.value);
++		for (let item of targets) {
++			await this.setStars(item.id, stars);
++		}
++	};
++
++	this.collectPDFItems = async function () {
++		let payload = [];
++		let libraries = [];
++		try {
++			libraries = Array.from(Zotero.Libraries.getAll());
++		}
++		catch (e) {
++			libraries = [{ libraryID: Zotero.Libraries.userLibraryID }];
++		}
++		for (let library of libraries) {
++			let items = [];
++			try {
++				items = await Zotero.Items.getAll(library.libraryID, false, false, false);
++			}
++			catch (e) {
++				continue;
++			}
++			for (let item of items) {
++				if (!this.shouldHandleItem(item)) {
++					continue;
++				}
++				try {
++					let path = await item.getFilePathAsync();
++					if (!path) {
++						continue;
++					}
++					payload.push({
++						path,
++						itemID: item.id,
++						title: this.getTitle(item, path)
++					});
++				}
++				catch (e) {}
++			}
++		}
++		return payload;
++	};
++
++	this.syncLibrary = async function () {
++		try {
++			let items = await this.collectPDFItems();
++			if (!items.length) {
++				Services.prompt.alert(null, 'SciReader 同步', '没有找到可同步的本地 PDF。');
++				return;
++			}
++			let confirm = Services.prompt.confirm(
++				null,
++				'SciReader 同步',
++				`将同步 ${items.length} 个 PDF 以及已生成的 AI 阅读缓存到 WebDAV。是否继续？`
++			);
++			if (!confirm) {
++				return;
++			}
++			let result = await this.postJSON('/api/sync', { items }, { timeout: 900000 });
++			if (result.error) {
++				Services.prompt.alert(null, 'SciReader 同步失败', result.error);
++				return;
++			}
++			Services.prompt.alert(null, 'SciReader 同步完成', `已同步 ${result.documents || 0} 篇论文，上传 ${result.uploaded || 0} 个文件。`);
++		}
++		catch (e) {
++			Services.prompt.alert(null, 'SciReader 同步失败', String(e));
++		}
++	};
++
 +	this.renderStarsCell = function (index, data, column, doc = document, rowItem = null) {
 +		let cell = doc.createElement('span');
 +		cell.className = `cell ${column.className}`;
 +		cell.style.cssText = 'display:inline-flex;align-items:center;gap:1px;white-space:nowrap;';
++		data = this.displayCellData(data);
 +		let target = this.getColumnItem(rowItem);
 +		if (!data || !target) {
 +			return cell;
@@ -907,6 +1223,8 @@ index 0000000..abdce8b
 +			let star = doc.createElement('span');
 +			star.textContent = i <= stars ? '★' : '☆';
 +			star.title = `${i} 星`;
++			star.setAttribute('role', 'button');
++			star.tabIndex = 0;
 +			star.style.cssText = [
 +				'cursor:pointer',
 +				'font-size:15px',
@@ -914,11 +1232,22 @@ index 0000000..abdce8b
 +				'color:#f59e0b',
 +				'user-select:none'
 +			].join(';');
-+			star.addEventListener('click', (event) => {
++			let applyStar = (event) => {
 +				event.preventDefault();
 +				event.stopPropagation();
++				if (event.stopImmediatePropagation) {
++					event.stopImmediatePropagation();
++				}
 +				this.setStars(target.id, i).catch(e => Zotero.debug(`AI Reflow star update failed: ${e}`));
-+			});
++			};
++			star.addEventListener('mousedown', applyStar, true);
++			star.addEventListener('click', applyStar, true);
++			star.addEventListener('dblclick', applyStar, true);
++			star.addEventListener('keydown', (event) => {
++				if (event.key === 'Enter' || event.key === ' ') {
++					applyStar(event);
++				}
++			}, true);
 +			cell.append(star);
 +		}
 +		return cell;
@@ -935,12 +1264,28 @@ index 0000000..abdce8b
 +				pluginID: this.columnPluginID,
 +				enabledTreeIDs: ['main'],
 +				defaultIn: ['*'],
-+				sortReverse: false,
++				sortReverse: true,
 +				flex: 1,
 +				minWidth: 160,
 +				dataProvider: (item) => this.venueColumnData(item),
 +				renderCell: function (index, data, column, _isFirstColumn, doc) {
 +					return Zotero.AIReflow.renderVenueCell(index, data, column, doc);
++				},
++				zoteroPersist: ['width', 'hidden', 'sortDirection']
++			});
++			Zotero.ItemTreeManager.registerColumn({
++				dataKey: 'aiReflowCode',
++				label: '开源',
++				pluginID: this.columnPluginID,
++				enabledTreeIDs: ['main'],
++				defaultIn: ['*'],
++				sortReverse: true,
++				width: '140',
++				staticWidth: true,
++				minWidth: 110,
++				dataProvider: (item) => this.codeColumnData(item),
++				renderCell: function (index, data, column, _isFirstColumn, doc) {
++					return Zotero.AIReflow.renderCodeCell(index, data, column, doc);
 +				},
 +				zoteroPersist: ['width', 'hidden', 'sortDirection']
 +			});
@@ -1064,6 +1409,7 @@ index 0000000..abdce8b
 +		return true;
 +	};
 +
++	this.disableNativeCloudSync();
 +	this.startColumnRegistration();
 +};
 diff --git a/chrome/content/zotero/xpcom/attachments.js b/chrome/content/zotero/xpcom/attachments.js
@@ -1188,6 +1534,71 @@ index 52cbc4a..469ab9c 100644
  		if (!res) return null;
  		
  		if (res.arxiv) {
+diff --git a/chrome/content/zotero/xpcom/schema.js b/chrome/content/zotero/xpcom/schema.js
+index 05ef593..09c5b56 100644
+--- a/chrome/content/zotero/xpcom/schema.js
++++ b/chrome/content/zotero/xpcom/schema.js
+@@ -1685,6 +1685,31 @@ Zotero.Schema = new function () {
+ 		}
+ 		_nextRepositoryUpdate = null;
+ 	}
++
++	function _isLocalFileAccessError(e) {
++		return e && (
++			e.name == 'NotAllowedError'
++			|| e.name == 'ReadOnlyError'
++			|| e.becauseAccessDenied
++			|| String(e).includes('NS_ERROR_FILE_ACCESS_DENIED')
++			|| String(e).includes('ACCESS_DENIED')
++		);
++	}
++
++	function _removeDirectoryBestEffort(dir, label) {
++		try {
++			dir.remove(true);
++			return true;
++		}
++		catch (e) {
++			if (_isLocalFileAccessError(e)) {
++				Zotero.debug(`Could not remove locked ${label} directory '${dir.path}'; continuing in local build`, 1);
++				return false;
++			}
++			Zotero.logError(e);
++			return false;
++		}
++	}
+ 	
+ 	
+ 	this.resetTranslatorsAndStyles = async function () {
+@@ -1703,8 +1728,8 @@ Zotero.Schema = new function () {
+ 		var translatorsDir = Zotero.getTranslatorsDirectory();
+ 		var stylesDir = Zotero.getStylesDirectory();
+ 		
+-		translatorsDir.remove(true);
+-		stylesDir.remove(true);
++		_removeDirectoryBestEffort(translatorsDir, 'translators');
++		_removeDirectoryBestEffort(stylesDir, 'styles');
+ 		
+ 		// Recreate directories
+ 		Zotero.getTranslatorsDirectory();
+@@ -1733,7 +1758,7 @@ Zotero.Schema = new function () {
+ 		_dbVersions.lastcheck = null;
+ 		
+ 		var translatorsDir = Zotero.getTranslatorsDirectory();
+-		translatorsDir.remove(true);
++		_removeDirectoryBestEffort(translatorsDir, 'translators');
+ 		Zotero.getTranslatorsDirectory(); // recreate directory
+ 		await Zotero.Translators.reinit();
+ 		var updated = await this.updateBundledFiles('translators');
+@@ -1754,7 +1779,7 @@ Zotero.Schema = new function () {
+ 		_dbVersions.lastcheck = null;
+ 		
+ 		var stylesDir = Zotero.getStylesDirectory();
+-		stylesDir.remove(true);
++		_removeDirectoryBestEffort(stylesDir, 'styles');
+ 		Zotero.getStylesDirectory(); // recreate directory
+ 		await Zotero.Styles.reinit()
+ 		var updated = await this.updateBundledFiles('styles');
 diff --git a/chrome/content/zotero/xpcom/streamer.js b/chrome/content/zotero/xpcom/streamer.js
 index 63278a9..761be9d 100644
 --- a/chrome/content/zotero/xpcom/streamer.js
@@ -1287,6 +1698,86 @@ index 83e9a53..8a01e7c 100644
  	}
  	
  	// check to see if this style depended on a hidden one
+diff --git a/chrome/content/zotero/xpcom/translation/translators.js b/chrome/content/zotero/xpcom/translation/translators.js
+index 4fbf137..60404f8 100644
+--- a/chrome/content/zotero/xpcom/translation/translators.js
++++ b/chrome/content/zotero/xpcom/translation/translators.js
+@@ -41,6 +41,30 @@ Zotero.Translators = new function () {
+ 	
+ 	this._translatorsHash = null;
+ 	this._sortedTranslatorHash = null;
++
++	var _isFileAccessDeniedError = function (e) {
++		return e && (
++			e.name == 'NotAllowedError'
++			|| e.name == 'ReadOnlyError'
++			|| e.becauseAccessDenied
++			|| String(e).includes('NS_ERROR_FILE_ACCESS_DENIED')
++			|| String(e).includes('ACCESS_DENIED')
++		);
++	};
++
++	var _removeTranslatorFile = async function (path) {
++		try {
++			await OS.File.remove(path);
++			return true;
++		}
++		catch (e) {
++			if (_isFileAccessDeniedError(e)) {
++				Zotero.debug(`Could not remove locked translator file '${path}'; ignoring in local build`, 1);
++				return false;
++			}
++			throw e;
++		}
++	};
+ 	
+ 	/**
+ 	 * Initializes translator cache, loading all translator metadata into memory
+@@ -153,7 +177,7 @@ Zotero.Translators = new function () {
+ 							// so that the translator is reinstalled the next time it's updated.
+ 							//
+ 							// TODO: Reinstall the correct translator immediately
+-							await OS.File.remove(path);
++							await _removeTranslatorFile(path);
+ 							let sql = "DELETE FROM translatorCache WHERE fileName=?";
+ 							await Zotero.DB.queryAsync(sql, fileName);
+ 							continue;
+@@ -174,7 +198,7 @@ Zotero.Translators = new function () {
+ 							translator.logError("Deleting older translator "
+ 								+ existingTranslator.fileName + " with same ID as "
+ 								+ translator.fileName);
+-							await OS.File.remove(existingTranslator.path);
++							await _removeTranslatorFile(existingTranslator.path);
+ 							await removeFromCaches(existingTranslator);
+ 						}
+ 						// If cached translator is newer, keep it and discard this one
+@@ -182,7 +206,7 @@ Zotero.Translators = new function () {
+ 							translator.logError("Deleting older translator "
+ 								+ translator.fileName + " with same ID as "
+ 								+ existingTranslator.fileName);
+-							await OS.File.remove(translator.path);
++							await _removeTranslatorFile(translator.path);
+ 							await removeFromDBCache(translator.fileName);
+ 							continue;
+ 						}
+@@ -192,7 +216,7 @@ Zotero.Translators = new function () {
+ 							translator.logError("Translator " + existingTranslator.fileName
+ 								+ " with same ID is already loaded and matches label -- deleting "
+ 								+ translator.fileName);
+-							await OS.File.remove(translator.path);
++							await _removeTranslatorFile(translator.path);
+ 							await removeFromDBCache(translator.fileName);
+ 							continue;
+ 						}
+@@ -201,7 +225,7 @@ Zotero.Translators = new function () {
+ 							translator.logError("Deleting translator " + translator.fileName
+ 								+ " with same ID as " + existingTranslator.fileName + " but with "
+ 								+ "mismatched filename");
+-							await OS.File.remove(existingTranslator.path);
++							await _removeTranslatorFile(existingTranslator.path);
+ 							await removeFromCaches(existingTranslator);
+ 						}
+ 					}
 diff --git a/chrome/content/zotero/xpcom/zotero.js b/chrome/content/zotero/xpcom/zotero.js
 index e6c17ba..3325ca2 100644
 --- a/chrome/content/zotero/xpcom/zotero.js
@@ -1346,32 +1837,152 @@ index c8dc7ce..b46fe46 100644
  	'fileHandlers',
  	'plugins',
  	'pluginAPI/menuManager',
+diff --git a/chrome/content/zotero/zoteroPane.js b/chrome/content/zotero/zoteroPane.js
+index 5fc0dc7..6bcfeb9 100644
+--- a/chrome/content/zotero/zoteroPane.js
++++ b/chrome/content/zotero/zoteroPane.js
+@@ -142,14 +142,12 @@ var ZoteroPane = new function () {
+ 		
+ 		// Set the sync tooltip label
+ 		let syncLabel = document.getElementById('zotero-tb-sync-label');
+-		syncLabel.value = Zotero.getString('sync.syncWith', ZOTERO_CONFIG.DOMAIN_NAME);
++		syncLabel.value = 'SciReader WebDAV 同步';
+ 		let syncButton = document.querySelector("#zotero-tb-sync");
+ 		syncButton.setAttribute("aria-label", syncLabel.value);
+ 		// Update the aria-description on focus
+ 		syncButton.addEventListener("focus", function (_) {
+-			Zotero.Sync.Runner.registerSyncStatus(this.firstChild);
+-			let lastSync = document.querySelector("#zotero-tb-sync-last-sync").value;
+-			this.setAttribute("aria-description", lastSync || "");
++			this.setAttribute("aria-description", "同步本地 PDF 和 AI 阅读缓存");
+ 		});
+ 		
+ 		// register an observer for Zotero reload
+@@ -1333,7 +1331,7 @@ var ZoteroPane = new function () {
+ 					ZoteroPane_Local.newNote(event.altKey, parentKey);
+ 					break;
+ 				case 'sync':
+-					Zotero.Sync.Runner.sync();
++					Zotero.AIReflow?.syncLibrary();
+ 					break;
+ 				case 'saveToZotero':
+ 					var collectionTreeRow = this.getCollectionTreeRow();
+@@ -2840,16 +2838,8 @@ var ZoteroPane = new function () {
+ 	
+ 	
+ 	this.sync = function () {
+-		if (Zotero.Sync.Runner.syncInProgress) {
+-			Zotero.Sync.Runner.stop();
+-		}
+-		else {
+-			this.hideSyncReminder();
+-
+-			Zotero.Sync.Server.canAutoResetClient = true;
+-			Zotero.Sync.Server.manualSyncRequired = false;
+-			Zotero.Sync.Runner.sync();
+-		}
++		this.hideSyncReminder();
++		Zotero.AIReflow?.syncLibrary();
+ 	};
+ 
+ 
 diff --git a/chrome/content/zotero/zoteroPane.xhtml b/chrome/content/zotero/zoteroPane.xhtml
-index 62de138..e2054c7 100644
+index 62de138..4b62f7c 100644
 --- a/chrome/content/zotero/zoteroPane.xhtml
 +++ b/chrome/content/zotero/zoteroPane.xhtml
-@@ -702,6 +702,17 @@
+@@ -702,6 +702,27 @@
  								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
  								type="checkbox"
  							/>
 +							<menuitem id="view-menuitem-ai-reflow-progress"
 +								class="menu-type-library"
-+								label="AI Reflow 后台进度提示"
++								label="SciReader 后台进度提示"
 +								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +								type="checkbox"
 +							/>
 +							<menuitem id="view-menuitem-ai-reflow-keys"
 +								class="menu-type-library"
-+								label="AI Reflow 接口设置"
++								label="SciReader 设置"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++							/>
++							<menuitem id="view-menuitem-ai-reflow-stars"
++								class="menu-type-library"
++								label="SciReader 设置重要性"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++							/>
++							<menuitem id="view-menuitem-ai-reflow-sync"
++								class="menu-type-library"
++								label="SciReader 云同步"
 +								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +							/>
  							<menuseparator/>
  							<menuitem id="show-tabs-menu"
  								data-l10n-id="menu-show-tabs-menu"
+@@ -910,12 +931,12 @@
+ 				buttons[0].focus();
+ 			}" />
+ 			
+-			<toolbarbutton id="zotero-tb-sync" tabindex="-1" class="zotero-tb-button" tooltip="_child"
+-					oncommand="ZoteroPane.sync()">
++			<toolbarbutton id="zotero-tb-sync" tabindex="-1" class="zotero-tb-button" tooltiptext="SciReader WebDAV 同步"
++					oncommand="Zotero.AIReflow?.syncLibrary()">
+ 				<tooltip
+ 						id="zotero-tb-sync-tooltip"
+-						onpopupshowing="Zotero.Sync.Runner.registerSyncStatus(this)"
+-						onpopuphiding="Zotero.Sync.Runner.registerSyncStatus()"
++						onpopupshowing="document.getElementById('zotero-tb-sync-label').value = 'SciReader WebDAV 同步'"
++						onpopuphiding=""
+ 						noautohide="true">
+ 					<label id="zotero-tb-sync-label"/>
+ 					<label id="zotero-tb-sync-status" class="sync-button-tooltip-status" hidden="true"/>
+@@ -1351,6 +1372,34 @@
+ 														/>
+ 													</menupopup>
+ 												</toolbarbutton>
++
++												<toolbarbutton
++													id="scireader-tb-settings"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="SciReader 设置"
++													tooltiptext="配置 DeepSeek、easyScholar 和 WebDAV"
++													style="padding: 0 9px; min-width: 78px;"
++													oncommand="Zotero.AIReflow?.configureSettings()"
++												/>
++												<toolbarbutton
++													id="scireader-tb-sync"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="云同步"
++													tooltiptext="同步 PDF 和 AI 阅读文件到 WebDAV"
++													style="padding: 0 9px; min-width: 54px;"
++													oncommand="Zotero.AIReflow?.syncLibrary()"
++												/>
++												<toolbarbutton
++													id="scireader-tb-stars"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="重要性"
++													tooltiptext="给选中文章设置 0-5 星重要性"
++													style="padding: 0 9px; min-width: 54px;"
++													oncommand="Zotero.AIReflow?.promptSetStars()"
++												/>
+ 												
+ 												<spacer flex="1"/>
+ 												<image id="zotero-tb-search-spinner" class="zotero-spinner-16"/>
 diff --git a/defaults/preferences/zotero.js b/defaults/preferences/zotero.js
-index 054b7bf..3be3c55 100644
+index 054b7bf..8bf7015 100644
 --- a/defaults/preferences/zotero.js
 +++ b/defaults/preferences/zotero.js
+@@ -18,7 +18,7 @@ pref("extensions.zotero.debug.store.limit",500000);
+ pref("extensions.zotero.debug.store.submitSize",10000000);
+ pref("extensions.zotero.debug.store.submitLineLength",10000);
+ pref("extensions.zotero.debug.level",5);
+-pref("extensions.zotero.automaticScraperUpdates",true);
++pref("extensions.zotero.automaticScraperUpdates",false);
+ pref("extensions.zotero.triggerProxyAuthentication", true);
+ // Proxy auth URLs should respond successfully to HEAD requests over HTTP and HTTPS (in case of forced HTTPS requests)
+ pref("extensions.zotero.proxyAuthenticationURLs", "https://www.acm.org,https://www.ebscohost.com,https://www.sciencedirect.com,https://ieeexplore.ieee.org,https://www.jstor.org,http://www.ovid.com,https://link.springer.com,https://www.tandfonline.com");
 @@ -39,6 +39,7 @@ pref("extensions.zotero.autoRenameFiles.fileTypes", "application/pdf,application
  pref("extensions.zotero.autoRenameFiles.onMetadataChange", true);
  pref("extensions.zotero.autoRenameFiles.done", true);
@@ -1380,6 +1991,37 @@ index 054b7bf..3be3c55 100644
  pref("extensions.zotero.showAttachmentFilenames", false);
  pref("extensions.zotero.capitalizeTitles", false);
  pref("extensions.zotero.launchNonNativeFiles", false);
+@@ -163,14 +164,14 @@ pref("extensions.zotero.httpServer.localAPI.enabled", false);
+ pref("extensions.zotero.zeroconf.server.enabled", false);
+ 
+ // Streaming server
+-pref("extensions.zotero.streaming.enabled", true);
++pref("extensions.zotero.streaming.enabled", false);
+ 
+ // Sync
+-pref("extensions.zotero.sync.autoSync", true);
++pref("extensions.zotero.sync.autoSync", false);
+ pref("extensions.zotero.sync.server.username", "");
+ pref("extensions.zotero.sync.server.compressData", true);
+-pref("extensions.zotero.sync.storage.enabled", true);
+-pref("extensions.zotero.sync.storage.protocol", "zotero");
++pref("extensions.zotero.sync.storage.enabled", false);
++pref("extensions.zotero.sync.storage.protocol", "webdav");
+ pref("extensions.zotero.sync.storage.verified", false);
+ pref("extensions.zotero.sync.storage.scheme", "https");
+ pref("extensions.zotero.sync.storage.url", "");
+@@ -182,9 +183,9 @@ pref("extensions.zotero.sync.storage.groups.enabled", true);
+ pref("extensions.zotero.sync.storage.downloadMode.personal", "on-sync");
+ pref("extensions.zotero.sync.storage.downloadMode.groups", "on-sync");
+ pref("extensions.zotero.sync.fulltext.enabled", true);
+-pref("extensions.zotero.sync.reminder.setUp.enabled", true);
++pref("extensions.zotero.sync.reminder.setUp.enabled", false);
+ pref("extensions.zotero.sync.reminder.setUp.lastDisplayed", 0);
+-pref("extensions.zotero.sync.reminder.autoSync.enabled", true);
++pref("extensions.zotero.sync.reminder.autoSync.enabled", false);
+ pref("extensions.zotero.sync.reminder.autoSync.lastDisplayed", 0);
+ 
+ // Proxy
 diff --git a/js-build/babel-worker.js b/js-build/babel-worker.js
 index 154a4e3..0ba9a5b 100644
 --- a/js-build/babel-worker.js

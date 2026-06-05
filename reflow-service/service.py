@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import base64
@@ -33,6 +34,7 @@ except Exception:
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_ROOT = ROOT / "reflow-cache"
 CONFIG_PATH = CACHE_ROOT / "config.json"
+WEBDAV_ROOT = "SciReader"
 PORT = int(os.environ.get("REFLOW_PORT", "27621"))
 DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
@@ -122,13 +124,17 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
+def error_text(exc):
+    return str(exc) or repr(exc) or type(exc).__name__
+
+
 def read_json(path, default=None):
     if not path.exists():
         return default
     last_error = None
     for _ in range(3):
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
             last_error = exc
             time.sleep(0.03)
@@ -178,11 +184,142 @@ def get_secret(primary, aliases=()):
 
 
 def config_status():
+    config = get_config()
+    webdav_url = config.get("WEBDAV_URL") or os.environ.get("WEBDAV_URL", "https://dav.jianguoyun.com/dav/")
+    webdav_user = config.get("WEBDAV_USERNAME") or os.environ.get("WEBDAV_USERNAME", "")
     return {
         "deepseekConfigured": bool(get_secret("DEEPSEEK_API_KEY")),
         "easyScholarConfigured": bool(get_secret("EASYSCHOLAR_SECRET_KEY", ("EASYSCHOLAR_SECRETKEY", "EASYSCHOLAR_KEY"))),
-        "deepseekModel": get_config().get("DEEPSEEK_MODEL") or os.environ.get("DEEPSEEK_MODEL", DEEPSEEK_MODEL),
+        "deepseekModel": config.get("DEEPSEEK_MODEL") or os.environ.get("DEEPSEEK_MODEL", DEEPSEEK_MODEL),
+        "webdavConfigured": bool(webdav_url and webdav_user and get_secret("WEBDAV_PASSWORD", ("WEBDAV_APP_PASSWORD",))),
+        "webdavUrl": webdav_url,
+        "webdavUser": webdav_user,
     }
+
+
+def safe_remote_name(name, fallback="untitled"):
+    name = compact_text(name).replace("\\", " ").replace("/", " ")
+    name = re.sub(r"[<>:\"|?*\x00-\x1f]+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        name = fallback
+    return name[:120]
+
+
+def webdav_config():
+    config = get_config()
+    url = compact_text(config.get("WEBDAV_URL") or os.environ.get("WEBDAV_URL", "https://dav.jianguoyun.com/dav/"))
+    user = compact_text(config.get("WEBDAV_USERNAME") or os.environ.get("WEBDAV_USERNAME", ""))
+    password = get_secret("WEBDAV_PASSWORD", ("WEBDAV_APP_PASSWORD",))
+    if not url:
+        raise RuntimeError("WEBDAV_URL is not configured")
+    if not user or not password:
+        raise RuntimeError("WebDAV account or app password is not configured")
+    if not url.endswith("/"):
+        url += "/"
+    return {"url": url, "user": user, "password": password}
+
+
+def webdav_url(config, parts):
+    quoted = "/".join(urllib.parse.quote(str(part).strip("/"), safe="") for part in parts if str(part).strip("/"))
+    return urllib.parse.urljoin(config["url"], quoted)
+
+
+def webdav_request(config, method, parts, data=None, content_type="application/octet-stream", timeout=120):
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(f"{config['user']}:{config['password']}".encode("utf-8")).decode("ascii"),
+        "User-Agent": "SciReader/1.0",
+    }
+    if data is not None:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(webdav_url(config, parts), data=data, headers=headers, method=method)
+    last_error = None
+    for attempt in range(3):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+            time.sleep(0.8 * (attempt + 1))
+    raise last_error
+
+
+def webdav_mkcol(config, parts):
+    built = []
+    for part in parts:
+        built.append(part)
+        try:
+            with webdav_request(config, "MKCOL", built, timeout=30):
+                pass
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (301, 302, 405):
+                raise
+
+
+def webdav_put_file(config, remote_parts, path):
+    data = Path(path).read_bytes()
+    with webdav_request(config, "PUT", remote_parts, data=data, timeout=180) as resp:
+        return getattr(resp, "status", 200)
+
+
+def iter_cache_files(doc_id):
+    target = doc_dir(doc_id)
+    if not target.exists():
+        return []
+    return [p for p in target.rglob("*") if p.is_file() and not p.name.endswith(".tmp")]
+
+
+def sync_items_to_webdav(items):
+    config = webdav_config()
+    webdav_mkcol(config, [WEBDAV_ROOT])
+    webdav_mkcol(config, [WEBDAV_ROOT, "pdfs"])
+    webdav_mkcol(config, [WEBDAV_ROOT, "ai"])
+
+    uploaded = 0
+    synced_docs = []
+    for raw in items or []:
+        pdf_path = safe_pdf_path(raw.get("path") or "")
+        doc_id = file_id(pdf_path)
+        title = safe_remote_name(raw.get("title") or pdf_path.stem, pdf_path.stem)
+        pdf_name = safe_remote_name(f"{title} - {doc_id}") + ".pdf"
+        webdav_put_file(config, [WEBDAV_ROOT, "pdfs", pdf_name], pdf_path)
+        uploaded += 1
+
+        webdav_mkcol(config, [WEBDAV_ROOT, "ai", doc_id])
+        cache_files = iter_cache_files(doc_id)
+        for file_path in cache_files:
+            rel = file_path.relative_to(doc_dir(doc_id))
+            remote_parts = [WEBDAV_ROOT, "ai", doc_id]
+            for part in rel.parts[:-1]:
+                remote_parts.append(safe_remote_name(part, "folder"))
+                webdav_mkcol(config, remote_parts)
+            remote_parts.append(safe_remote_name(rel.name, "file"))
+            webdav_put_file(config, remote_parts, file_path)
+            uploaded += 1
+        synced_docs.append({"id": doc_id, "title": title, "files": 1 + len(cache_files)})
+
+    manifest = {
+        "app": "SciReader",
+        "updated": now(),
+        "documents": synced_docs,
+    }
+    webdav_put_file(
+        config,
+        [WEBDAV_ROOT, "manifest.json"],
+        write_temp_json(manifest),
+    )
+    uploaded += 1
+    return {"ok": True, "uploaded": uploaded, "documents": len(synced_docs)}
+
+
+def write_temp_json(obj):
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = CACHE_ROOT / "webdav-manifest.tmp.json"
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def clean_pdf_text(text):
@@ -1054,15 +1191,9 @@ def metadata_rank_score(meta):
     ccf = normalize_ccf(meta.get("ccf"))
     sci = normalize_quartile(meta.get("sci"))
     jcr = normalize_quartile(meta.get("jcr"))
-    if ccf == "A" or sci == "Q1" or jcr == "Q1":
-        return 4
-    if ccf == "B" or sci == "Q2" or jcr == "Q2":
-        return 3
-    if ccf == "C" or sci == "Q3" or jcr == "Q3":
-        return 2
-    if sci == "Q4" or jcr == "Q4":
-        return 1
-    return 0
+    ccf_score = {"A": 3, "B": 2, "C": 1}.get(ccf, 0)
+    quartile_score = {"Q1": 4, "Q2": 3, "Q3": 2, "Q4": 1}
+    return ccf_score + max(quartile_score.get(sci, 0), quartile_score.get(jcr, 0))
 
 
 def normalize_publication_name(name):
@@ -1115,6 +1246,85 @@ def metadata_from_easyscholar(publication_name):
     return meta
 
 
+def normalize_code_url(url):
+    url = compact_text(url)
+    if not url or url == "未知":
+        return ""
+    if url.startswith("www."):
+        url = "https://" + url
+    if not re.match(r"^https?://", url, re.I):
+        return ""
+    return url
+
+
+def verify_code_url(url):
+    url = normalize_code_url(url)
+    if not url:
+        return {"codeStatus": "未知", "codeVerified": False, "codeEvidence": ""}
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    try:
+        if host == "github.com" or host.endswith(".github.com"):
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 2:
+                owner = parts[0]
+                repo = parts[1].replace(".git", "")
+                api_url = f"https://api.github.com/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}"
+                try:
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "SciReader/1.0"})
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                    if payload.get("full_name"):
+                        return {
+                            "codeStatus": "开源",
+                            "codeVerified": True,
+                            "codeEvidence": f"GitHub 仓库存在：{payload.get('full_name')}",
+                        }
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404:
+                        return {
+                            "codeStatus": "疑似假开源",
+                            "codeVerified": False,
+                            "codeEvidence": "GitHub 仓库不存在，HTTP 404",
+                        }
+                    if exc.code in (403, 405):
+                        return {
+                            "codeStatus": "开源",
+                            "codeVerified": True,
+                            "codeEvidence": f"GitHub API 访问受限但仓库链接格式有效，HTTP {exc.code}",
+                        }
+                except Exception:
+                    pass
+        req = urllib.request.Request(url, headers={"User-Agent": "SciReader/1.0"}, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status < 400:
+                return {
+                    "codeStatus": "开源",
+                    "codeVerified": True,
+                    "codeEvidence": f"代码链接可访问，HTTP {resp.status}",
+                }
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 405):
+            return {
+                "codeStatus": "开源",
+                "codeVerified": True,
+                "codeEvidence": f"代码链接存在访问限制，HTTP {exc.code}",
+            }
+        return {
+            "codeStatus": "疑似假开源",
+            "codeVerified": False,
+            "codeEvidence": f"代码链接无法访问，HTTP {exc.code}",
+        }
+    except Exception as exc:
+        return {
+            "codeStatus": "待验证",
+            "codeVerified": False,
+            "codeEvidence": f"代码链接校验失败：{error_text(exc)}",
+        }
+    return {"codeStatus": "未知", "codeVerified": False, "codeEvidence": ""}
+
+
 def ensure_metadata(doc_id, force=False):
     target_dir = doc_dir(doc_id)
     cache_path = target_dir / "metadata.json"
@@ -1154,6 +1364,9 @@ def ensure_metadata(doc_id, force=False):
                         "ccf": "A/B/C/未知",
                         "sci": "Q1/Q2/Q3/Q4/未知",
                         "jcr": "Q1/Q2/Q3/Q4/未知",
+                        "codeStatus": "开源/未开源/未知/疑似假开源",
+                        "codeUrl": "论文明确给出的代码仓库或项目主页 URL，未知则填未知",
+                        "codeEvidence": "一句话说明代码开源判断依据",
                         "evidence": "一句话说明判断依据",
                     },
                 }, ensure_ascii=False),
@@ -1170,6 +1383,10 @@ def ensure_metadata(doc_id, force=False):
         "sci": normalize_quartile(parsed.get("sci")),
         "jcr": normalize_quartile(parsed.get("jcr")),
         "evidence": compact_text(parsed.get("evidence") or ""),
+        "codeStatus": compact_text(parsed.get("codeStatus") or "未知") or "未知",
+        "codeUrl": normalize_code_url(parsed.get("codeUrl") or ""),
+        "codeEvidence": compact_text(parsed.get("codeEvidence") or ""),
+        "codeVerified": False,
         "rankSource": "DeepSeek",
         "updated": now(),
     }
@@ -1186,6 +1403,15 @@ def ensure_metadata(doc_id, force=False):
         if easy_meta:
             meta.update(easy_meta)
             break
+    if meta.get("codeUrl"):
+        checked = verify_code_url(meta["codeUrl"])
+        meta["codeStatus"] = checked.get("codeStatus") or meta.get("codeStatus") or "未知"
+        meta["codeVerified"] = bool(checked.get("codeVerified"))
+        evidence = checked.get("codeEvidence") or ""
+        if evidence:
+            meta["codeEvidence"] = (meta.get("codeEvidence") + "；" + evidence).strip("；")
+    elif meta.get("codeStatus") not in {"开源", "未开源", "未知", "疑似假开源"}:
+        meta["codeStatus"] = "未知"
     if not meta["title"]:
         meta["title"] = fallback_title or "Untitled PDF"
     meta["rankScore"] = metadata_rank_score(meta)
@@ -1241,7 +1467,7 @@ def loading_page(title, doc_id, source_path):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{safe_title} - AI Reflow</title>
+  <title>{safe_title} - SciReader</title>
 <style>
 body {{ margin: 0; background: #f5f7fa; color: #1d2433; font: 16px/1.7 "Segoe UI", system-ui, sans-serif; }}
 .panel {{ max-width: 760px; margin: 12vh auto; background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 28px 32px; }}
@@ -1252,7 +1478,7 @@ body {{ margin: 0; background: #f5f7fa; color: #1d2433; font: 16px/1.7 "Segoe UI
 </head>
 <body>
 <div class="panel">
-  <h2>AI Reflow 正在本地解析</h2>
+  <h2>SciReader 正在本地解析</h2>
   <p id="stage">任务已进入后台队列，可以关闭此页面，稍后重新打开会继续读取本地缓存。</p>
   <div class="bar"><div id="fill" class="fill"></div></div>
   <p class="muted">{escaped_path}</p>
@@ -1285,7 +1511,7 @@ def html_page(title, doc_id, article, source_path):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{safe_title} - AI Reflow</title>
+  <title>{safe_title} - SciReader</title>
 <style>
 :root {{
   color-scheme: light;
@@ -1529,28 +1755,6 @@ figcaption {{
   color: var(--muted);
   font-size: 12px;
 }}
-.config-grid {{
-  display: grid;
-  gap: 9px;
-  padding: 0 14px 14px;
-}}
-.config-grid[hidden] {{
-  display: none;
-}}
-.config-grid label {{
-  display: grid;
-  gap: 4px;
-  color: #344054;
-  font-size: 12px;
-  font-weight: 650;
-}}
-.config-grid input {{
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font: 13px/1.5 Consolas, "SFMono-Regular", monospace;
-}}
 @media (max-width: 760px) {{
   body {{ font-size: 15px; }}
   .topbar {{ flex-wrap: wrap; }}
@@ -1564,10 +1768,9 @@ figcaption {{
 </head>
 <body>
 <div class="topbar">
-  <div class="brand">Z</div>
+  <div class="brand">S</div>
   <button class="primary" onclick="summarize()">DeepSeek 摘要</button>
   <button onclick="openChat()">DeepSeek 问答</button>
-  <button onclick="openConfig()">接口设置</button>
   <div class="source" title="{escaped_path}">{escaped_path}</div>
   <button id="fullscreenBtn" class="fullscreen-toggle" onclick="toggleFullscreen()" title="全屏阅读">⛶ 全屏阅读</button>
 </div>
@@ -1582,18 +1785,6 @@ figcaption {{
     <div class="chat-actions">
       <span class="chat-hint">Ctrl+Enter 发送</span>
       <button id="chatSend" class="primary" onclick="askDeepSeek()">发送</button>
-    </div>
-  </div>
-  <div id="configBox" class="config-grid" hidden>
-    <label>DeepSeek API Key
-      <input id="deepseekKeyInput" type="password" autocomplete="off" placeholder="sk-...">
-    </label>
-    <label>easyScholar SecretKey
-      <input id="easyScholarKeyInput" type="password" autocomplete="off" placeholder="easyScholar SecretKey">
-    </label>
-    <div class="chat-actions">
-      <span id="configHint" class="chat-hint">密钥只保存到本地缓存，不会显示在页面上。</span>
-      <button class="primary" onclick="saveConfig()">保存</button>
     </div>
   </div>
 </div>
@@ -1613,10 +1804,6 @@ const aiBody = document.getElementById('aiBody');
 const chatBox = document.getElementById('chatBox');
 const chatInput = document.getElementById('chatInput');
 const chatSend = document.getElementById('chatSend');
-const configBox = document.getElementById('configBox');
-const deepseekKeyInput = document.getElementById('deepseekKeyInput');
-const easyScholarKeyInput = document.getElementById('easyScholarKeyInput');
-const configHint = document.getElementById('configHint');
 
 function escapeHTML(text) {{
   return String(text || '')
@@ -1675,9 +1862,6 @@ function showAI(text, title = 'DeepSeek', options = {{}}) {{
   if (chatBox) {{
     chatBox.hidden = !chat;
   }}
-  if (configBox) {{
-    configBox.hidden = true;
-  }}
   ai.classList.toggle('empty', !text && !chat);
   if (text) {{
     setTimeout(typesetAI, 0);
@@ -1693,42 +1877,6 @@ function closeAI() {{
 
 function openChat() {{
   showAI('可以直接询问这篇论文的核心方法、实验结论、公式含义、图表内容或局限性。回答会基于本地解析和已缓存的译文。', 'DeepSeek 问答', {{ chat: true }});
-}}
-
-async function openConfig() {{
-  aiTitle.textContent = '接口设置';
-  aiBody.innerHTML = '<p>输入或更新本地 API Key。密码框不会回显，留空表示保持原配置不变。</p>';
-  if (chatBox) chatBox.hidden = true;
-  if (configBox) configBox.hidden = false;
-  ai.classList.remove('empty');
-  if (deepseekKeyInput) deepseekKeyInput.value = '';
-  if (easyScholarKeyInput) easyScholarKeyInput.value = '';
-  try {{
-    const r = await fetch('/api/config');
-    const data = await r.json();
-    configHint.textContent = `DeepSeek：${{data.deepseekConfigured ? '已配置' : '未配置'}}；easyScholar：${{data.easyScholarConfigured ? '已配置' : '未配置'}}`;
-  }}
-  catch (err) {{
-    configHint.textContent = '读取配置状态失败';
-  }}
-}}
-
-async function saveConfig() {{
-  const body = {{
-    deepseekKey: deepseekKeyInput && deepseekKeyInput.value || '',
-    easyScholarKey: easyScholarKeyInput && easyScholarKeyInput.value || ''
-  }};
-  const r = await fetch('/api/config', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify(body)
-  }});
-  const data = await r.json();
-  if (deepseekKeyInput) deepseekKeyInput.value = '';
-  if (easyScholarKeyInput) easyScholarKeyInput.value = '';
-  configHint.textContent = data.error
-    ? ('保存失败：' + data.error)
-    : `已保存。DeepSeek：${{data.deepseekConfigured ? '已配置' : '未配置'}}；easyScholar：${{data.easyScholarConfigured ? '已配置' : '未配置'}}`;
 }}
 
 function nativeFullscreenElement() {{
@@ -1966,13 +2114,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"text": text, "cached": False, "savedPath": meta.get("sidecar")})
             return self.send_text(404, "Not found", "text/plain; charset=utf-8")
         except Exception as exc:
-            return self.send_json(500, {"error": str(exc)})
+            return self.send_json(500, {"error": error_text(exc)})
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(size).decode("utf-8") if size else "{}"
+            body = self.rfile.read(size).decode("utf-8-sig") if size else "{}"
             data = json.loads(body)
             if parsed.path == "/api/explain-asset":
                 doc_id = str(data.get("id", ""))
@@ -2002,6 +2150,12 @@ class Handler(BaseHTTPRequestHandler):
                 question = str(data.get("question", ""))
                 result = answer_paper_question(doc_id, question)
                 return self.send_json(200, {"text": result})
+            if parsed.path == "/api/sync":
+                items = data.get("items") or []
+                if not isinstance(items, list):
+                    raise ValueError("items must be a list")
+                result = sync_items_to_webdav(items)
+                return self.send_json(200, result)
             if parsed.path == "/api/config":
                 updates = {}
                 if data.get("deepseekKey"):
@@ -2010,11 +2164,17 @@ class Handler(BaseHTTPRequestHandler):
                     updates["EASYSCHOLAR_SECRET_KEY"] = data.get("easyScholarKey")
                 if data.get("deepseekModel"):
                     updates["DEEPSEEK_MODEL"] = data.get("deepseekModel")
+                if data.get("webdavUrl"):
+                    updates["WEBDAV_URL"] = data.get("webdavUrl")
+                if data.get("webdavUser"):
+                    updates["WEBDAV_USERNAME"] = data.get("webdavUser")
+                if data.get("webdavPassword"):
+                    updates["WEBDAV_PASSWORD"] = data.get("webdavPassword")
                 save_config(updates)
                 return self.send_json(200, config_status())
             return self.send_text(404, "Not found", "text/plain; charset=utf-8")
         except Exception as exc:
-            return self.send_json(500, {"error": str(exc)})
+            return self.send_json(500, {"error": error_text(exc)})
 
     def serve_cache(self, request_path):
         parts = request_path.split("/")
