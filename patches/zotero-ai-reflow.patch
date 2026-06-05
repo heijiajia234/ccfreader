@@ -66,7 +66,7 @@ index ad96024..cb3aec5 100755
          # Delete styles build script
          os.remove(os.path.join(tmp_src_dir, 'styles', 'update'))
 diff --git a/chrome/content/zotero/standalone/standalone.js b/chrome/content/zotero/standalone/standalone.js
-index a7723e9..2083ece 100644
+index a7723e9..f90f17f 100644
 --- a/chrome/content/zotero/standalone/standalone.js
 +++ b/chrome/content/zotero/standalone/standalone.js
 @@ -523,6 +523,11 @@ const ZoteroStandalone = new function () {
@@ -81,7 +81,7 @@ index a7723e9..2083ece 100644
  		this.onUpdateCustomMenus(event, 'view');
  	};
  
-@@ -661,6 +666,12 @@ const ZoteroStandalone = new function () {
+@@ -661,6 +666,18 @@ const ZoteroStandalone = new function () {
  			case 'hide-context-annotation-rows':
  				this.toggleBooleanPref('hideContextAnnotationRows');
  				break;
@@ -91,15 +91,21 @@ index a7723e9..2083ece 100644
 +					Zotero.AIReflow.setProgressEnabled(!Zotero.AIReflow.isProgressEnabled());
 +				}
 +				break;
++
++			case 'ai-reflow-keys':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.configureKeys();
++				}
++				break;
  		}
  	};
  	
 diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
 new file mode 100644
-index 0000000..416ac42
+index 0000000..abdce8b
 --- /dev/null
 +++ b/chrome/content/zotero/xpcom/aiReflow.js
-@@ -0,0 +1,875 @@
+@@ -0,0 +1,960 @@
 +/*
 +    Local AI reflow bridge for PDF attachments.
 +*/
@@ -128,6 +134,46 @@ index 0000000..416ac42
 +		Zotero.Prefs.set('aiReflow.showProgress', !!enabled);
 +		if (!enabled) {
 +			this.closeAllProgress();
++		}
++	};
++
++	this.configureKeys = async function () {
++		let deepseek = { value: '' };
++		let easyscholar = { value: '' };
++		let check = { value: false };
++		let ok = Services.prompt.promptPassword(
++			null,
++			'AI Reflow DeepSeek Key',
++			'输入新的 DeepSeek API Key（留空则不修改）：',
++			deepseek,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.promptPassword(
++			null,
++			'AI Reflow easyScholar Key',
++			'输入新的 easyScholar SecretKey（留空则不修改）：',
++			easyscholar,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		try {
++			let response = await this.postJSON('/api/config', {
++				deepseekKey: deepseek.value,
++				easyScholarKey: easyscholar.value
++			}, { timeout: 20000 });
++			let message = `DeepSeek：${response.deepseekConfigured ? '已配置' : '未配置'}\n`
++				+ `easyScholar：${response.easyScholarConfigured ? '已配置' : '未配置'}`;
++			Services.prompt.alert(null, 'AI Reflow 接口设置', message);
++		}
++		catch (e) {
++			Services.prompt.alert(null, 'AI Reflow 接口设置失败', String(e));
 +		}
 +	};
 +
@@ -202,6 +248,7 @@ index 0000000..416ac42
 +			path,
 +			itemID: item.id,
 +			title: this.getTitle(item, path),
++			venue: this.getPublicationVenue(item),
 +			...params
 +		};
 +		let pairs = [];
@@ -217,6 +264,19 @@ index 0000000..416ac42
 +	this.jsonRequest = async function (url, options = {}) {
 +		let response = await Zotero.HTTP.request('GET', url, {
 +			timeout: options.timeout || 30000,
++			responseType: 'json'
++		});
++		if (response.response) {
++			return response.response;
++		}
++		return JSON.parse(response.responseText || '{}');
++	};
++
++	this.postJSON = async function (endpoint, body, options = {}) {
++		let response = await Zotero.HTTP.request('POST', `${this.baseURL}${endpoint}`, {
++			timeout: options.timeout || 30000,
++			headers: { 'Content-Type': 'application/json' },
++			body: JSON.stringify(body || {}),
 +			responseType: 'json'
 +		});
 +		if (response.response) {
@@ -243,6 +303,25 @@ index 0000000..416ac42
 +			.replace(/</g, '&lt;')
 +			.replace(/>/g, '&gt;')
 +			.replace(/"/g, '&quot;');
++	};
++
++	this.getPublicationVenue = function (item) {
++		let target = this.getColumnItem(item);
++		if (!target && item?.parentItemID) {
++			target = Zotero.Items.get(item.parentItemID);
++		}
++		target = target || item;
++		let fields = ['publicationTitle', 'conferenceName', 'proceedingsTitle', 'journalAbbreviation'];
++		for (let field of fields) {
++			try {
++				let value = target.getField(field);
++				if (value && String(value).trim()) {
++					return String(value).trim();
++				}
++			}
++			catch (e) {}
++		}
++		return '';
 +	};
 +
 +	this.getColumnItem = function (item) {
@@ -716,9 +795,9 @@ index 0000000..416ac42
 +			return '';
 +		}
 +		let score = this.rankScore(data);
++		let grade = ['未知', 'D档', 'C档', 'B档', 'A档'][score] || '未知';
 +		return [
-+			String(score).padStart(2, '0'),
-+			target.id,
++			grade,
 +			data.Venue || '未知',
 +			data.CCF || '未知',
 +			data.SCI || '未知',
@@ -733,25 +812,25 @@ index 0000000..416ac42
 +		}
 +		let data = this.parseAIExtra(target);
 +		let stars = this.normalizeStars(data.Stars);
-+		return `${stars}\t${target.id}`;
++		return `${stars}星 ${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}`;
 +	};
 +
 +	this.badgeStyle = function (label) {
 +		label = String(label || '').toUpperCase();
-+		if (/CCF-A|Q1/.test(label)) {
++		if (/A档|CCF-A|Q1/.test(label)) {
 +			return { background: '#dc2626', color: '#fff' };
 +		}
-+		if (/CCF-B|Q2/.test(label)) {
++		if (/B档|CCF-B|Q2/.test(label)) {
 +			return { background: '#16a34a', color: '#fff' };
 +		}
-+		if (/CCF-C|Q3/.test(label)) {
++		if (/C档|CCF-C|Q3/.test(label)) {
 +			return { background: '#facc15', color: '#1f2937' };
 +		}
 +		return { background: '#e5e7eb', color: '#374151' };
 +	};
 +
-+	this.makeBadge = function (text) {
-+		let badge = document.createElement('span');
++	this.makeBadge = function (text, doc = document) {
++		let badge = doc.createElement('span');
 +		let style = this.badgeStyle(text);
 +		badge.textContent = text;
 +		badge.style.cssText = [
@@ -770,30 +849,33 @@ index 0000000..416ac42
 +		return badge;
 +	};
 +
-+	this.renderVenueCell = function (index, data, column) {
-+		let cell = document.createElement('span');
++	this.renderVenueCell = function (index, data, column, doc = document) {
++		let cell = doc.createElement('span');
 +		cell.className = `cell ${column.className}`;
 +		cell.style.cssText = 'display:flex;align-items:center;gap:5px;min-width:0;overflow:hidden;';
 +		if (!data) {
 +			return cell;
 +		}
-+		let [, , venue, ccf, sci, jcr] = String(data).split('\t');
-+		let venueSpan = document.createElement('span');
++		let [grade, venue, ccf, sci, jcr] = String(data).split('\t');
++		let venueSpan = doc.createElement('span');
 +		venueSpan.textContent = venue && venue !== '未知' ? venue : '未知';
 +		venueSpan.title = venueSpan.textContent;
 +		venueSpan.style.cssText = 'min-width:44px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
 +		cell.append(venueSpan);
++		if (grade && grade !== '未知') {
++			cell.append(this.makeBadge(grade, doc));
++		}
 +		if (ccf && ccf !== '未知') {
-+			cell.append(this.makeBadge(`CCF-${ccf}`));
++			cell.append(this.makeBadge(`CCF-${ccf}`, doc));
 +		}
 +		if (sci && sci !== '未知') {
-+			cell.append(this.makeBadge(`SCI-${sci}`));
++			cell.append(this.makeBadge(`SCI-${sci}`, doc));
 +		}
 +		if (jcr && jcr !== '未知') {
-+			cell.append(this.makeBadge(`JCR-${jcr}`));
++			cell.append(this.makeBadge(`JCR-${jcr}`, doc));
 +		}
 +		if (cell.childNodes.length === 1 && venueSpan.textContent === '未知') {
-+			cell.append(this.makeBadge('未知'));
++			cell.append(this.makeBadge('未知', doc));
 +		}
 +		return cell;
 +	};
@@ -812,17 +894,17 @@ index 0000000..416ac42
 +		catch (e) {}
 +	};
 +
-+	this.renderStarsCell = function (index, data, column) {
-+		let cell = document.createElement('span');
++	this.renderStarsCell = function (index, data, column, doc = document, rowItem = null) {
++		let cell = doc.createElement('span');
 +		cell.className = `cell ${column.className}`;
 +		cell.style.cssText = 'display:inline-flex;align-items:center;gap:1px;white-space:nowrap;';
-+		if (!data) {
++		let target = this.getColumnItem(rowItem);
++		if (!data || !target) {
 +			return cell;
 +		}
-+		let [starsText, itemID] = String(data).split('\t');
-+		let stars = this.normalizeStars(starsText);
++		let stars = Math.max(0, Math.min(5, (String(data).match(/★/g) || []).length));
 +		for (let i = 1; i <= 5; i++) {
-+			let star = document.createElement('span');
++			let star = doc.createElement('span');
 +			star.textContent = i <= stars ? '★' : '☆';
 +			star.title = `${i} 星`;
 +			star.style.cssText = [
@@ -835,7 +917,7 @@ index 0000000..416ac42
 +			star.addEventListener('click', (event) => {
 +				event.preventDefault();
 +				event.stopPropagation();
-+				this.setStars(itemID, i).catch(e => Zotero.debug(`AI Reflow star update failed: ${e}`));
++				this.setStars(target.id, i).catch(e => Zotero.debug(`AI Reflow star update failed: ${e}`));
 +			});
 +			cell.append(star);
 +		}
@@ -853,11 +935,13 @@ index 0000000..416ac42
 +				pluginID: this.columnPluginID,
 +				enabledTreeIDs: ['main'],
 +				defaultIn: ['*'],
-+				sortReverse: true,
++				sortReverse: false,
 +				flex: 1,
 +				minWidth: 160,
 +				dataProvider: (item) => this.venueColumnData(item),
-+				renderCell: (index, data, column) => this.renderVenueCell(index, data, column),
++				renderCell: function (index, data, column, _isFirstColumn, doc) {
++					return Zotero.AIReflow.renderVenueCell(index, data, column, doc);
++				},
 +				zoteroPersist: ['width', 'hidden', 'sortDirection']
 +			});
 +			Zotero.ItemTreeManager.registerColumn({
@@ -871,7 +955,14 @@ index 0000000..416ac42
 +				staticWidth: true,
 +				minWidth: 84,
 +				dataProvider: (item) => this.starsColumnData(item),
-+				renderCell: (index, data, column) => this.renderStarsCell(index, data, column),
++				renderCell: function (index, data, column, _isFirstColumn, doc) {
++					let rowItem = null;
++					try {
++						rowItem = this.getRow(index)?.ref;
++					}
++					catch (e) {}
++					return Zotero.AIReflow.renderStarsCell(index, data, column, doc, rowItem);
++				},
 +				zoteroPersist: ['width', 'hidden', 'sortDirection']
 +			});
 +			this._columnsRegistered = true;
@@ -1256,10 +1347,10 @@ index c8dc7ce..b46fe46 100644
  	'plugins',
  	'pluginAPI/menuManager',
 diff --git a/chrome/content/zotero/zoteroPane.xhtml b/chrome/content/zotero/zoteroPane.xhtml
-index 62de138..e7b4066 100644
+index 62de138..e2054c7 100644
 --- a/chrome/content/zotero/zoteroPane.xhtml
 +++ b/chrome/content/zotero/zoteroPane.xhtml
-@@ -702,6 +702,12 @@
+@@ -702,6 +702,17 @@
  								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
  								type="checkbox"
  							/>
@@ -1268,6 +1359,11 @@ index 62de138..e7b4066 100644
 +								label="AI Reflow 后台进度提示"
 +								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +								type="checkbox"
++							/>
++							<menuitem id="view-menuitem-ai-reflow-keys"
++								class="menu-type-library"
++								label="AI Reflow 接口设置"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +							/>
  							<menuseparator/>
  							<menuitem id="show-tabs-menu"

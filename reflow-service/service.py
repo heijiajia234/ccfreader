@@ -32,6 +32,7 @@ except Exception:
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_ROOT = ROOT / "reflow-cache"
+CONFIG_PATH = CACHE_ROOT / "config.json"
 PORT = int(os.environ.get("REFLOW_PORT", "27621"))
 DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
@@ -147,6 +148,43 @@ def get_status(doc_id):
     return read_json(doc_dir(doc_id) / "status.json", {"status": "missing", "updated": now()})
 
 
+def get_config():
+    return read_json(CONFIG_PATH, {}) or {}
+
+
+def save_config(updates):
+    config = get_config()
+    for key, value in updates.items():
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            config[key] = value
+    write_json(CONFIG_PATH, config)
+    return config
+
+
+def get_secret(primary, aliases=()):
+    config = get_config()
+    for key in (primary, *aliases):
+        value = str(config.get(key) or "").strip()
+        if value:
+            return value
+    for key in (primary, *aliases):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def config_status():
+    return {
+        "deepseekConfigured": bool(get_secret("DEEPSEEK_API_KEY")),
+        "easyScholarConfigured": bool(get_secret("EASYSCHOLAR_SECRET_KEY", ("EASYSCHOLAR_SECRETKEY", "EASYSCHOLAR_KEY"))),
+        "deepseekModel": get_config().get("DEEPSEEK_MODEL") or os.environ.get("DEEPSEEK_MODEL", DEEPSEEK_MODEL),
+    }
+
+
 def clean_pdf_text(text):
     text = html.unescape(str(text or ""))
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -224,11 +262,12 @@ def asset_src(doc_id, name):
 
 
 def call_deepseek(messages, max_tokens=1800):
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    api_key = get_secret("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
+    config = get_config()
     payload = {
-        "model": os.environ.get("DEEPSEEK_MODEL", DEEPSEEK_MODEL),
+        "model": config.get("DEEPSEEK_MODEL") or os.environ.get("DEEPSEEK_MODEL", DEEPSEEK_MODEL),
         "messages": messages,
         "temperature": 0.15,
         "max_tokens": max_tokens,
@@ -751,7 +790,7 @@ def extract_reflow(path, force=False):
     return doc_id, md, blocks, article
 
 
-def ingest_pdf(path, title=None, item_id=None, translate=AUTO_TRANSLATE, force=False):
+def ingest_pdf(path, title=None, item_id=None, venue=None, translate=AUTO_TRANSLATE, force=False):
     path = safe_pdf_path(path)
     doc_id = file_id(path)
     target_dir = doc_dir(doc_id)
@@ -759,6 +798,7 @@ def ingest_pdf(path, title=None, item_id=None, translate=AUTO_TRANSLATE, force=F
     write_json(target_dir / "source.json", {
         "path": str(path),
         "title": title or path.name,
+        "venue": venue or "",
         "itemID": item_id,
         "mtime": path.stat().st_mtime,
         "size": path.stat().st_size,
@@ -1025,6 +1065,56 @@ def metadata_rank_score(meta):
     return 0
 
 
+def normalize_publication_name(name):
+    name = compact_text(name)
+    if re.search(r"Proceedings of the National Academy of Sciences", name, re.I):
+        return "Proceedings of the National Academy of Sciences of the United States of America"
+    return name
+
+
+def query_easyscholar(publication_name):
+    secret_key = get_secret("EASYSCHOLAR_SECRET_KEY", ("EASYSCHOLAR_SECRETKEY", "EASYSCHOLAR_KEY"))
+    publication_name = normalize_publication_name(publication_name)
+    if not secret_key or not publication_name or publication_name == "未知":
+        return None
+    query = urllib.parse.urlencode({
+        "secretKey": secret_key,
+        "publicationName": publication_name,
+    })
+    url = f"https://easyscholar.cc/open/getPublicationRank?{query}"
+    with urllib.request.urlopen(url, timeout=60) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    data = payload.get("data") or {}
+    official = (((data.get("officialRank") or {}).get("all")) or {})
+    if not isinstance(official, dict) or not official:
+        return None
+    return official
+
+
+def metadata_from_easyscholar(publication_name):
+    ranks = query_easyscholar(publication_name)
+    if not ranks:
+        return None
+    ccf = normalize_ccf(ranks.get("ccf") or ranks.get("ccf_c"))
+    jcr = normalize_quartile(ranks.get("sci") or ranks.get("ssci"))
+    sci = normalize_quartile(ranks.get("sci") or ranks.get("ssci") or ranks.get("sciUp") or ranks.get("sciBase"))
+    meta = {
+        "venue": normalize_publication_name(publication_name),
+        "ccf": ccf,
+        "sci": sci,
+        "jcr": jcr,
+        "rankSource": "easyScholar",
+        "rankRaw": ranks,
+    }
+    meta["rankScore"] = metadata_rank_score(meta)
+    pieces = []
+    for key in ("ccf", "sci", "ssci", "sciUp", "sciBase", "sciif", "sciif5", "eii"):
+        if ranks.get(key):
+            pieces.append(f"{key}={ranks[key]}")
+    meta["evidence"] = "easyScholar: " + ("; ".join(pieces[:8]) if pieces else "已返回官方数据")
+    return meta
+
+
 def ensure_metadata(doc_id, force=False):
     target_dir = doc_dir(doc_id)
     cache_path = target_dir / "metadata.json"
@@ -1038,6 +1128,7 @@ def ensure_metadata(doc_id, force=False):
         raise ValueError("Document blocks are not ready")
     source = read_json(target_dir / "source.json", {}) or {}
     fallback_title = clean_source_title(source)
+    source_venue = compact_text(source.get("venue") or "")
     local_title = extract_paper_title(blocks, fallback_title) or fallback_title
     context = build_summary_context(blocks)[:METADATA_CONTEXT_CHARS]
     parsed = {}
@@ -1074,13 +1165,27 @@ def ensure_metadata(doc_id, force=False):
 
     meta = {
         "title": compact_text(parsed.get("title") or local_title or fallback_title),
-        "venue": compact_text(parsed.get("venue") or "未知") or "未知",
+        "venue": compact_text(source_venue or parsed.get("venue") or "未知") or "未知",
         "ccf": normalize_ccf(parsed.get("ccf")),
         "sci": normalize_quartile(parsed.get("sci")),
         "jcr": normalize_quartile(parsed.get("jcr")),
         "evidence": compact_text(parsed.get("evidence") or ""),
+        "rankSource": "DeepSeek",
         "updated": now(),
     }
+    publication_candidates = [
+        source_venue,
+        meta.get("venue"),
+    ]
+    for publication_name in publication_candidates:
+        try:
+            easy_meta = metadata_from_easyscholar(publication_name)
+        except Exception as exc:
+            meta["rankError"] = str(exc)
+            easy_meta = None
+        if easy_meta:
+            meta.update(easy_meta)
+            break
     if not meta["title"]:
         meta["title"] = fallback_title or "Untitled PDF"
     meta["rankScore"] = metadata_rank_score(meta)
@@ -1424,6 +1529,28 @@ figcaption {{
   color: var(--muted);
   font-size: 12px;
 }}
+.config-grid {{
+  display: grid;
+  gap: 9px;
+  padding: 0 14px 14px;
+}}
+.config-grid[hidden] {{
+  display: none;
+}}
+.config-grid label {{
+  display: grid;
+  gap: 4px;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 650;
+}}
+.config-grid input {{
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: 13px/1.5 Consolas, "SFMono-Regular", monospace;
+}}
 @media (max-width: 760px) {{
   body {{ font-size: 15px; }}
   .topbar {{ flex-wrap: wrap; }}
@@ -1440,6 +1567,7 @@ figcaption {{
   <div class="brand">Z</div>
   <button class="primary" onclick="summarize()">DeepSeek 摘要</button>
   <button onclick="openChat()">DeepSeek 问答</button>
+  <button onclick="openConfig()">接口设置</button>
   <div class="source" title="{escaped_path}">{escaped_path}</div>
   <button id="fullscreenBtn" class="fullscreen-toggle" onclick="toggleFullscreen()" title="全屏阅读">⛶ 全屏阅读</button>
 </div>
@@ -1454,6 +1582,18 @@ figcaption {{
     <div class="chat-actions">
       <span class="chat-hint">Ctrl+Enter 发送</span>
       <button id="chatSend" class="primary" onclick="askDeepSeek()">发送</button>
+    </div>
+  </div>
+  <div id="configBox" class="config-grid" hidden>
+    <label>DeepSeek API Key
+      <input id="deepseekKeyInput" type="password" autocomplete="off" placeholder="sk-...">
+    </label>
+    <label>easyScholar SecretKey
+      <input id="easyScholarKeyInput" type="password" autocomplete="off" placeholder="easyScholar SecretKey">
+    </label>
+    <div class="chat-actions">
+      <span id="configHint" class="chat-hint">密钥只保存到本地缓存，不会显示在页面上。</span>
+      <button class="primary" onclick="saveConfig()">保存</button>
     </div>
   </div>
 </div>
@@ -1473,6 +1613,10 @@ const aiBody = document.getElementById('aiBody');
 const chatBox = document.getElementById('chatBox');
 const chatInput = document.getElementById('chatInput');
 const chatSend = document.getElementById('chatSend');
+const configBox = document.getElementById('configBox');
+const deepseekKeyInput = document.getElementById('deepseekKeyInput');
+const easyScholarKeyInput = document.getElementById('easyScholarKeyInput');
+const configHint = document.getElementById('configHint');
 
 function escapeHTML(text) {{
   return String(text || '')
@@ -1531,6 +1675,9 @@ function showAI(text, title = 'DeepSeek', options = {{}}) {{
   if (chatBox) {{
     chatBox.hidden = !chat;
   }}
+  if (configBox) {{
+    configBox.hidden = true;
+  }}
   ai.classList.toggle('empty', !text && !chat);
   if (text) {{
     setTimeout(typesetAI, 0);
@@ -1546,6 +1693,42 @@ function closeAI() {{
 
 function openChat() {{
   showAI('可以直接询问这篇论文的核心方法、实验结论、公式含义、图表内容或局限性。回答会基于本地解析和已缓存的译文。', 'DeepSeek 问答', {{ chat: true }});
+}}
+
+async function openConfig() {{
+  aiTitle.textContent = '接口设置';
+  aiBody.innerHTML = '<p>输入或更新本地 API Key。密码框不会回显，留空表示保持原配置不变。</p>';
+  if (chatBox) chatBox.hidden = true;
+  if (configBox) configBox.hidden = false;
+  ai.classList.remove('empty');
+  if (deepseekKeyInput) deepseekKeyInput.value = '';
+  if (easyScholarKeyInput) easyScholarKeyInput.value = '';
+  try {{
+    const r = await fetch('/api/config');
+    const data = await r.json();
+    configHint.textContent = `DeepSeek：${{data.deepseekConfigured ? '已配置' : '未配置'}}；easyScholar：${{data.easyScholarConfigured ? '已配置' : '未配置'}}`;
+  }}
+  catch (err) {{
+    configHint.textContent = '读取配置状态失败';
+  }}
+}}
+
+async function saveConfig() {{
+  const body = {{
+    deepseekKey: deepseekKeyInput && deepseekKeyInput.value || '',
+    easyScholarKey: easyScholarKeyInput && easyScholarKeyInput.value || ''
+  }};
+  const r = await fetch('/api/config', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify(body)
+  }});
+  const data = await r.json();
+  if (deepseekKeyInput) deepseekKeyInput.value = '';
+  if (easyScholarKeyInput) easyScholarKeyInput.value = '';
+  configHint.textContent = data.error
+    ? ('保存失败：' + data.error)
+    : `已保存。DeepSeek：${{data.deepseekConfigured ? '已配置' : '未配置'}}；easyScholar：${{data.easyScholarConfigured ? '已配置' : '未配置'}}`;
 }}
 
 function nativeFullscreenElement() {{
@@ -1705,17 +1888,21 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/health":
                 return self.send_json(200, {"ok": True, "time": now()})
+            if parsed.path == "/api/config":
+                return self.send_json(200, config_status())
             if parsed.path == "/api/ingest":
                 path = safe_pdf_path(qs.get("path", [""])[0])
                 title = qs.get("title", [path.name])[0]
+                venue = qs.get("venue", [""])[0]
                 item_id = qs.get("itemID", [""])[0] or None
                 translate = qs.get("translate", ["1"])[0] != "0"
                 force = qs.get("force", ["0"])[0] == "1"
-                doc_id, status = ingest_pdf(path, title=title, item_id=item_id, translate=translate, force=force)
+                doc_id, status = ingest_pdf(path, title=title, item_id=item_id, venue=venue, translate=translate, force=force)
                 return self.send_json(200, {"id": doc_id, **status})
             if parsed.path == "/reflow":
                 path = safe_pdf_path(qs.get("path", [""])[0])
                 title = qs.get("title", [path.name])[0]
+                venue = qs.get("venue", [""])[0]
                 item_id = qs.get("itemID", [""])[0] or None
                 doc_id = file_id(path)
                 status = get_status(doc_id)
@@ -1724,7 +1911,7 @@ class Handler(BaseHTTPRequestHandler):
                     blocks = get_blocks(doc_id)
                     if blocks:
                         if not translation_cache_complete(doc_id, blocks):
-                            doc_id, status = ingest_pdf(path, title=title, item_id=item_id, translate=True)
+                            doc_id, status = ingest_pdf(path, title=title, item_id=item_id, venue=venue, translate=True)
                             return self.send_text(200, loading_page(title, doc_id, path))
                         if not blocks_have_translations(blocks):
                             blocks = translate_blocks(doc_id, blocks)
@@ -1732,7 +1919,7 @@ class Handler(BaseHTTPRequestHandler):
                             article = render_article(blocks)
                             (doc_dir(doc_id) / "article.html").write_text(article, encoding="utf-8")
                 if not article or status.get("status") != "ready":
-                    doc_id, status = ingest_pdf(path, title=title, item_id=item_id, translate=AUTO_TRANSLATE)
+                    doc_id, status = ingest_pdf(path, title=title, item_id=item_id, venue=venue, translate=AUTO_TRANSLATE)
                     article = get_article(doc_id)
                 if not article or status.get("status") != "ready":
                     return self.send_text(200, loading_page(title, doc_id, path))
@@ -1815,6 +2002,16 @@ class Handler(BaseHTTPRequestHandler):
                 question = str(data.get("question", ""))
                 result = answer_paper_question(doc_id, question)
                 return self.send_json(200, {"text": result})
+            if parsed.path == "/api/config":
+                updates = {}
+                if data.get("deepseekKey"):
+                    updates["DEEPSEEK_API_KEY"] = data.get("deepseekKey")
+                if data.get("easyScholarKey"):
+                    updates["EASYSCHOLAR_SECRET_KEY"] = data.get("easyScholarKey")
+                if data.get("deepseekModel"):
+                    updates["DEEPSEEK_MODEL"] = data.get("deepseekModel")
+                save_config(updates)
+                return self.send_json(200, config_status())
             return self.send_text(404, "Not found", "text/plain; charset=utf-8")
         except Exception as exc:
             return self.send_json(500, {"error": str(exc)})
