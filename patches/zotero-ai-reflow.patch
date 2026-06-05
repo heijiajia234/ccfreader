@@ -96,20 +96,24 @@ index a7723e9..2083ece 100644
  	
 diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
 new file mode 100644
-index 0000000..32d46d6
+index 0000000..416ac42
 --- /dev/null
 +++ b/chrome/content/zotero/xpcom/aiReflow.js
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,875 @@
 +/*
 +    Local AI reflow bridge for PDF attachments.
 +*/
 +
 +Zotero.AIReflow = new function () {
 +	this.baseURL = 'http://127.0.0.1:27621';
++	this.columnPluginID = 'ai-reflow@local';
++	this.aiExtraKeys = ['Venue', 'CCF', 'SCI', 'JCR', 'RankScore', 'Stars', 'Evidence'];
 +	this.summaryNoteTitle = 'AI Reflow 论文总结';
 +	this._summaryNoteTasks = new Set();
 +	this._metadataTasks = new Set();
++	this._metadataSyncTasks = new Set();
 +	this._progressTasks = new Map();
++	this._columnsRegistered = false;
 +
 +	this.isProgressEnabled = function () {
 +		try {
@@ -241,6 +245,92 @@ index 0000000..32d46d6
 +			.replace(/"/g, '&quot;');
 +	};
 +
++	this.getColumnItem = function (item) {
++		if (!item) {
++			return null;
++		}
++		if (item.isRegularItem && item.isRegularItem()) {
++			return item;
++		}
++		if (item.parentItemID) {
++			let parentItem = Zotero.Items.get(item.parentItemID);
++			if (parentItem?.isRegularItem?.()) {
++				return parentItem;
++			}
++		}
++		return null;
++	};
++
++	this.parseAIExtra = function (item) {
++		let data = {};
++		if (!item?.getField) {
++			return data;
++		}
++		let extra = item.getField('extra') || '';
++		for (let line of extra.split(/\r?\n/)) {
++			let match = line.match(/^AI Reflow (Venue|CCF|SCI|JCR|RankScore|Stars|Evidence):\s*(.*)$/);
++			if (match) {
++				data[match[1]] = match[2].trim();
++			}
++		}
++		return data;
++	};
++
++	this.setAIExtra = function (item, updates) {
++		let existing = this.parseAIExtra(item);
++		let merged = { ...existing, ...updates };
++		let extra = item.getField('extra') || '';
++		let lines = extra
++			.split(/\r?\n/)
++			.filter(line => !/^AI Reflow (Venue|CCF|SCI|JCR|RankScore|Stars|Evidence):/.test(line));
++		while (lines.length && !lines[lines.length - 1].trim()) {
++			lines.pop();
++		}
++		if (lines.length) {
++			lines.push('');
++		}
++		for (let key of this.aiExtraKeys) {
++			let value = merged[key];
++			if (value !== undefined && value !== null && String(value).trim() !== '') {
++				lines.push(`AI Reflow ${key}: ${String(value).replace(/\s+/g, ' ').trim()}`);
++			}
++		}
++		item.setField('extra', lines.join('\n'));
++	};
++
++	this.rankScore = function (meta) {
++		let ccf = String(meta.CCF || '').toUpperCase();
++		let sci = String(meta.SCI || '').toUpperCase();
++		let jcr = String(meta.JCR || '').toUpperCase();
++		if (meta.RankScore !== undefined && meta.RankScore !== '') {
++			let parsed = parseInt(meta.RankScore, 10);
++			if (!isNaN(parsed)) {
++				return Math.max(0, Math.min(4, parsed));
++			}
++		}
++		if (ccf === 'A' || sci === 'Q1' || jcr === 'Q1') {
++			return 4;
++		}
++		if (ccf === 'B' || sci === 'Q2' || jcr === 'Q2') {
++			return 3;
++		}
++		if (ccf === 'C' || sci === 'Q3' || jcr === 'Q3') {
++			return 2;
++		}
++		if (sci === 'Q4' || jcr === 'Q4') {
++			return 1;
++		}
++		return 0;
++	};
++
++	this.normalizeStars = function (stars) {
++		let value = parseInt(stars, 10);
++		if (isNaN(value)) {
++			value = 0;
++		}
++		return Math.max(0, Math.min(5, value));
++	};
++
 +	this.summaryToNoteHTML = function (summary, savedPath) {
 +		let pathHTML = savedPath
 +			? `<p><strong>本地摘要文件：</strong>${this.escapeHTML(savedPath)}</p>`
@@ -292,6 +382,131 @@ index 0000000..32d46d6
 +			Zotero.debug(`AI Reflow fallback parent creation failed: ${e}`);
 +		}
 +		return this.getCurrentItem(currentItem);
++	};
++
++	this.looksLikeFallbackTitle = function (title, item, path) {
++		title = String(title || '').replace(/\s+/g, ' ').trim();
++		if (!title || title === 'Untitled PDF' || title === 'Full Text PDF') {
++			return true;
++		}
++		if (/^\d{4}\.\d{4,}(v\d+)?$/i.test(title)) {
++			return true;
++		}
++		let stem = '';
++		try {
++			stem = PathUtils.filename(path || item?.attachmentFilename || '').replace(/\.[^.]+$/, '');
++		}
++		catch (e) {}
++		let cleanStem = stem.replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim();
++		return !!(
++			stem
++			&& (
++				title === stem
++				|| title === cleanStem
++				|| title === this.cleanAttachmentTitle(item, path)
++			)
++		);
++	};
++
++	this.updateParentFromMetadata = async function (item, path, docID, metadata = null) {
++		if (!docID) {
++			return false;
++		}
++		let response = metadata;
++		if (!response) {
++			response = await this.jsonRequest(
++				`${this.baseURL}/api/metadata?id=${encodeURIComponent(docID)}`,
++				{ timeout: 90000 }
++			);
++		}
++		if (!response || response.status) {
++			return false;
++		}
++		item = await this.getCurrentItem(item);
++		let parentItem = await this.getSummaryParentItem(item);
++		if (!parentItem?.isRegularItem?.()) {
++			return false;
++		}
++
++		let changed = false;
++		let title = String(response.title || '').replace(/\s+/g, ' ').trim();
++		let currentTitle = parentItem.getField('title') || '';
++		if (title && title !== '未知' && title !== currentTitle && this.looksLikeFallbackTitle(currentTitle, item, path)) {
++			parentItem.setField('title', title);
++			changed = true;
++		}
++
++		let updates = {
++			Venue: response.venue || '未知',
++			CCF: response.ccf || '未知',
++			SCI: response.sci || '未知',
++			JCR: response.jcr || '未知',
++			RankScore: String(response.rankScore ?? this.rankScore({
++				CCF: response.ccf,
++				SCI: response.sci,
++				JCR: response.jcr
++			})),
++			Evidence: response.evidence || ''
++		};
++		let oldExtra = parentItem.getField('extra') || '';
++		this.setAIExtra(parentItem, updates);
++		if (parentItem.getField('extra') !== oldExtra) {
++			changed = true;
++		}
++
++		if (changed) {
++			await parentItem.saveTx();
++			try {
++				Zotero.ItemTreeManager?.refreshColumns?.();
++			}
++			catch (e) {}
++		}
++		return changed;
++	};
++
++	this.queueMetadataSync = function (item, docID, path) {
++		if (!docID) {
++			return;
++		}
++		let key = `${item.id}:${docID}`;
++		if (this._metadataSyncTasks.has(key)) {
++			return;
++		}
++		this._metadataSyncTasks.add(key);
++		(async () => {
++			try {
++				for (let i = 0; i < 240; i++) {
++					try {
++						let response = await this.jsonRequest(
++							`${this.baseURL}/api/metadata?id=${encodeURIComponent(docID)}`,
++							{ timeout: 90000 }
++						);
++						if (response && !response.status) {
++							await this.updateParentFromMetadata(item, path, docID, response);
++							return;
++						}
++					}
++					catch (e) {
++						Zotero.debug(`AI Reflow metadata sync poll failed: ${e}`);
++					}
++
++					try {
++						let status = await this.jsonRequest(
++							`${this.baseURL}/api/status?id=${encodeURIComponent(docID)}`,
++							{ timeout: 8000 }
++						);
++						if (status.status === 'error') {
++							return;
++						}
++					}
++					catch (e) {}
++					await this.delay(3000);
++				}
++			}
++			finally {
++				this._metadataSyncTasks.delete(key);
++			}
++		})();
 +	};
 +
 +	this.saveSummaryNote = async function (item, summary, savedPath) {
@@ -491,6 +706,197 @@ index 0000000..32d46d6
 +		})();
 +	};
 +
++	this.venueColumnData = function (item) {
++		let target = this.getColumnItem(item);
++		if (!target || target.id !== item.id) {
++			return '';
++		}
++		let data = this.parseAIExtra(target);
++		if (!data.Venue && !data.CCF && !data.SCI && !data.JCR) {
++			return '';
++		}
++		let score = this.rankScore(data);
++		return [
++			String(score).padStart(2, '0'),
++			target.id,
++			data.Venue || '未知',
++			data.CCF || '未知',
++			data.SCI || '未知',
++			data.JCR || '未知'
++		].join('\t');
++	};
++
++	this.starsColumnData = function (item) {
++		let target = this.getColumnItem(item);
++		if (!target || target.id !== item.id) {
++			return '';
++		}
++		let data = this.parseAIExtra(target);
++		let stars = this.normalizeStars(data.Stars);
++		return `${stars}\t${target.id}`;
++	};
++
++	this.badgeStyle = function (label) {
++		label = String(label || '').toUpperCase();
++		if (/CCF-A|Q1/.test(label)) {
++			return { background: '#dc2626', color: '#fff' };
++		}
++		if (/CCF-B|Q2/.test(label)) {
++			return { background: '#16a34a', color: '#fff' };
++		}
++		if (/CCF-C|Q3/.test(label)) {
++			return { background: '#facc15', color: '#1f2937' };
++		}
++		return { background: '#e5e7eb', color: '#374151' };
++	};
++
++	this.makeBadge = function (text) {
++		let badge = document.createElement('span');
++		let style = this.badgeStyle(text);
++		badge.textContent = text;
++		badge.style.cssText = [
++			'display:inline-flex',
++			'align-items:center',
++			'height:18px',
++			'padding:0 5px',
++			'border-radius:4px',
++			'font-size:11px',
++			'font-weight:700',
++			'line-height:18px',
++			'white-space:nowrap',
++			`background:${style.background}`,
++			`color:${style.color}`
++		].join(';');
++		return badge;
++	};
++
++	this.renderVenueCell = function (index, data, column) {
++		let cell = document.createElement('span');
++		cell.className = `cell ${column.className}`;
++		cell.style.cssText = 'display:flex;align-items:center;gap:5px;min-width:0;overflow:hidden;';
++		if (!data) {
++			return cell;
++		}
++		let [, , venue, ccf, sci, jcr] = String(data).split('\t');
++		let venueSpan = document.createElement('span');
++		venueSpan.textContent = venue && venue !== '未知' ? venue : '未知';
++		venueSpan.title = venueSpan.textContent;
++		venueSpan.style.cssText = 'min-width:44px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
++		cell.append(venueSpan);
++		if (ccf && ccf !== '未知') {
++			cell.append(this.makeBadge(`CCF-${ccf}`));
++		}
++		if (sci && sci !== '未知') {
++			cell.append(this.makeBadge(`SCI-${sci}`));
++		}
++		if (jcr && jcr !== '未知') {
++			cell.append(this.makeBadge(`JCR-${jcr}`));
++		}
++		if (cell.childNodes.length === 1 && venueSpan.textContent === '未知') {
++			cell.append(this.makeBadge('未知'));
++		}
++		return cell;
++	};
++
++	this.setStars = async function (itemID, stars) {
++		let item = Zotero.Items.get(parseInt(itemID, 10));
++		if (!item) {
++			return;
++		}
++		stars = this.normalizeStars(stars);
++		this.setAIExtra(item, { Stars: String(stars) });
++		await item.saveTx();
++		try {
++			Zotero.ItemTreeManager?.refreshColumns?.();
++		}
++		catch (e) {}
++	};
++
++	this.renderStarsCell = function (index, data, column) {
++		let cell = document.createElement('span');
++		cell.className = `cell ${column.className}`;
++		cell.style.cssText = 'display:inline-flex;align-items:center;gap:1px;white-space:nowrap;';
++		if (!data) {
++			return cell;
++		}
++		let [starsText, itemID] = String(data).split('\t');
++		let stars = this.normalizeStars(starsText);
++		for (let i = 1; i <= 5; i++) {
++			let star = document.createElement('span');
++			star.textContent = i <= stars ? '★' : '☆';
++			star.title = `${i} 星`;
++			star.style.cssText = [
++				'cursor:pointer',
++				'font-size:15px',
++				'line-height:18px',
++				'color:#f59e0b',
++				'user-select:none'
++			].join(';');
++			star.addEventListener('click', (event) => {
++				event.preventDefault();
++				event.stopPropagation();
++				this.setStars(itemID, i).catch(e => Zotero.debug(`AI Reflow star update failed: ${e}`));
++			});
++			cell.append(star);
++		}
++		return cell;
++	};
++
++	this.registerItemTreeColumns = function () {
++		if (this._columnsRegistered || !Zotero.ItemTreeManager) {
++			return false;
++		}
++		try {
++			Zotero.ItemTreeManager.registerColumn({
++				dataKey: 'aiReflowRank',
++				label: '论文等级',
++				pluginID: this.columnPluginID,
++				enabledTreeIDs: ['main'],
++				defaultIn: ['*'],
++				sortReverse: true,
++				flex: 1,
++				minWidth: 160,
++				dataProvider: (item) => this.venueColumnData(item),
++				renderCell: (index, data, column) => this.renderVenueCell(index, data, column),
++				zoteroPersist: ['width', 'hidden', 'sortDirection']
++			});
++			Zotero.ItemTreeManager.registerColumn({
++				dataKey: 'aiReflowStars',
++				label: '重要性',
++				pluginID: this.columnPluginID,
++				enabledTreeIDs: ['main'],
++				defaultIn: ['*'],
++				sortReverse: true,
++				width: '96',
++				staticWidth: true,
++				minWidth: 84,
++				dataProvider: (item) => this.starsColumnData(item),
++				renderCell: (index, data, column) => this.renderStarsCell(index, data, column),
++				zoteroPersist: ['width', 'hidden', 'sortDirection']
++			});
++			this._columnsRegistered = true;
++			Zotero.ItemTreeManager.refreshColumns();
++			return true;
++		}
++		catch (e) {
++			Zotero.debug(`AI Reflow column registration failed: ${e}`);
++			return false;
++		}
++	};
++
++	this.startColumnRegistration = function () {
++		let attempts = 0;
++		let tryRegister = () => {
++			if (this.registerItemTreeColumns()) {
++				return;
++			}
++			if (++attempts <= 60) {
++				Zotero.Promise.delay(500).then(tryRegister);
++			}
++		};
++		tryRegister();
++	};
++
 +	this.maximizeViewerWindow = function (win) {
 +		if (!win) {
 +			return;
@@ -534,6 +940,9 @@ index 0000000..32d46d6
 +			if (response.id && options.showProgress !== false) {
 +				this.trackProgress(response.id, item, path, response);
 +			}
++			if (response.id) {
++				this.queueMetadataSync(item, response.id, path);
++			}
 +			if (response.id && options.summaryNote !== false) {
 +				this.queueSummaryNote(item, response.id);
 +			}
@@ -563,6 +972,8 @@ index 0000000..32d46d6
 +		this.maximizeViewerWindow(win);
 +		return true;
 +	};
++
++	this.startColumnRegistration();
 +};
 diff --git a/chrome/content/zotero/xpcom/attachments.js b/chrome/content/zotero/xpcom/attachments.js
 index 54e3939..8daa5d3 100644

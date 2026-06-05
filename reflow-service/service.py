@@ -42,6 +42,8 @@ TRANSLATE_BATCH_ITEMS = int(os.environ.get("TRANSLATE_BATCH_ITEMS", "10"))
 REFLOW_WORKERS = int(os.environ.get("REFLOW_WORKERS", "3"))
 DEEPSEEK_WORKERS = int(os.environ.get("DEEPSEEK_WORKERS", "4"))
 SUMMARY_CONTEXT_CHARS = int(os.environ.get("SUMMARY_CONTEXT_CHARS", "36000"))
+METADATA_CONTEXT_CHARS = int(os.environ.get("METADATA_CONTEXT_CHARS", "16000"))
+CHAT_CONTEXT_CHARS = int(os.environ.get("CHAT_CONTEXT_CHARS", "28000"))
 
 JOBS = {}
 JOB_LOCK = threading.Lock()
@@ -776,8 +778,10 @@ def ingest_pdf(path, title=None, item_id=None, translate=AUTO_TRANSLATE, force=F
                     blocks = translate_blocks(doc_id, blocks, force=force)
                     write_json(doc_dir(doc_id) / "blocks.json", blocks)
                     (doc_dir(doc_id) / "article.html").write_text(render_article(blocks), encoding="utf-8")
-                    if AUTO_SUMMARY:
-                        ensure_summary(doc_id, force=force)
+                set_status(doc_id, status="classifying", stage="DeepSeek metadata", progress=94)
+                ensure_metadata(doc_id, force=force)
+                if translate and AUTO_SUMMARY:
+                    ensure_summary(doc_id, force=force)
                 set_status(doc_id, status="ready", stage="done", progress=100, error="")
             except Exception as exc:
                 set_status(doc_id, status="error", stage="error", progress=0, error=str(exc))
@@ -911,6 +915,217 @@ def ensure_summary(doc_id, force=False):
     text = clean_summary_text(text)
     write_summary_files(doc_id, text)
     return text
+
+
+def compact_text(text):
+    return re.sub(r"\s+", " ", clean_pdf_text(text)).strip(" .,:;|-")
+
+
+def clean_source_title(source):
+    title = compact_text(source.get("title") or "")
+    if not title and source.get("path"):
+        title = Path(source["path"]).stem
+    title = re.sub(r"\.pdf$", "", title, flags=re.I)
+    title = title.replace("_", " ")
+    return compact_text(title)
+
+
+def bad_title_candidate(text):
+    text = compact_text(text)
+    low = text.lower()
+    if len(text) < 8 or len(text) > 260:
+        return True
+    if re.fullmatch(r"\d{4}\.\d{4,}(v\d+)?", text, re.I):
+        return True
+    if re.match(r"^(abstract|keywords|ccs concepts|references|appendix|index terms)\b", low):
+        return True
+    if re.search(r"\b(university|institute|department|school|laboratory|lab)\b", text, re.I):
+        return True
+    if text.count(",") >= 2 and len(text.split()) < 26:
+        return True
+    return False
+
+
+def extract_paper_title(blocks, fallback=""):
+    candidates = []
+    before_abstract = []
+    for block in blocks[:30]:
+        text = compact_text(block.get("text") or "")
+        if not text:
+            continue
+        if re.match(r"^abstract\b", text, re.I):
+            break
+        if block.get("type") == "heading":
+            candidates.append(text)
+        elif not before_abstract and block.get("type") == "paragraph":
+            candidates.append(text)
+        before_abstract.append(text)
+
+    for candidate in candidates:
+        if not bad_title_candidate(candidate):
+            return candidate
+
+    if len(before_abstract) >= 2:
+        joined = compact_text(" ".join(before_abstract[:2]))
+        if not bad_title_candidate(joined):
+            return joined
+
+    fallback = compact_text(fallback)
+    return "" if bad_title_candidate(fallback) else fallback
+
+
+def parse_json_object(text):
+    raw = str(text or "").strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start : end + 1]
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("DeepSeek response is not a JSON object")
+    return data
+
+
+def normalize_ccf(value):
+    text = compact_text(value).upper()
+    if not text or text in {"UNKNOWN", "N/A", "NA", "NONE", "未知", "不详"}:
+        return "未知"
+    match = re.search(r"\b([ABC])\b|CCF[-\s]*([ABC])", text)
+    return (match.group(1) or match.group(2)) if match else "未知"
+
+
+def normalize_quartile(value):
+    text = compact_text(value).upper()
+    if not text or text in {"UNKNOWN", "N/A", "NA", "NONE", "未知", "不详"}:
+        return "未知"
+    if "一区" in text:
+        return "Q1"
+    if "二区" in text:
+        return "Q2"
+    if "三区" in text:
+        return "Q3"
+    if "四区" in text:
+        return "Q4"
+    match = re.search(r"\bQ([1-4])\b", text)
+    return f"Q{match.group(1)}" if match else "未知"
+
+
+def metadata_rank_score(meta):
+    ccf = normalize_ccf(meta.get("ccf"))
+    sci = normalize_quartile(meta.get("sci"))
+    jcr = normalize_quartile(meta.get("jcr"))
+    if ccf == "A" or sci == "Q1" or jcr == "Q1":
+        return 4
+    if ccf == "B" or sci == "Q2" or jcr == "Q2":
+        return 3
+    if ccf == "C" or sci == "Q3" or jcr == "Q3":
+        return 2
+    if sci == "Q4" or jcr == "Q4":
+        return 1
+    return 0
+
+
+def ensure_metadata(doc_id, force=False):
+    target_dir = doc_dir(doc_id)
+    cache_path = target_dir / "metadata.json"
+    if not force:
+        cached = read_json(cache_path, None)
+        if cached:
+            return cached
+
+    blocks = get_blocks(doc_id)
+    if not blocks:
+        raise ValueError("Document blocks are not ready")
+    source = read_json(target_dir / "source.json", {}) or {}
+    fallback_title = clean_source_title(source)
+    local_title = extract_paper_title(blocks, fallback_title) or fallback_title
+    context = build_summary_context(blocks)[:METADATA_CONTEXT_CHARS]
+    parsed = {}
+    error = ""
+    try:
+        result = call_deepseek([
+            {
+                "role": "system",
+                "content": (
+                    "你是计算机领域论文元数据识别助手。请只基于用户提供的论文标题和正文片段判断论文题名、录用刊物或会议、CCF 等级、SCI 分区、JCR 分区。"
+                    "如果正文没有可靠证据，字段填“未知”。只输出严格 JSON，不要解释。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({
+                    "titleCandidate": local_title,
+                    "sourceTitle": fallback_title,
+                    "paperContext": context,
+                    "schema": {
+                        "title": "论文正式英文标题",
+                        "venue": "会议或期刊名称，未知则填未知",
+                        "ccf": "A/B/C/未知",
+                        "sci": "Q1/Q2/Q3/Q4/未知",
+                        "jcr": "Q1/Q2/Q3/Q4/未知",
+                        "evidence": "一句话说明判断依据",
+                    },
+                }, ensure_ascii=False),
+            },
+        ], max_tokens=1400)
+        parsed = parse_json_object(result)
+    except Exception as exc:
+        error = str(exc)
+
+    meta = {
+        "title": compact_text(parsed.get("title") or local_title or fallback_title),
+        "venue": compact_text(parsed.get("venue") or "未知") or "未知",
+        "ccf": normalize_ccf(parsed.get("ccf")),
+        "sci": normalize_quartile(parsed.get("sci")),
+        "jcr": normalize_quartile(parsed.get("jcr")),
+        "evidence": compact_text(parsed.get("evidence") or ""),
+        "updated": now(),
+    }
+    if not meta["title"]:
+        meta["title"] = fallback_title or "Untitled PDF"
+    meta["rankScore"] = metadata_rank_score(meta)
+    if error:
+        meta["error"] = error
+    write_json(cache_path, meta)
+    return meta
+
+
+def answer_paper_question(doc_id, question):
+    question = compact_text(question)
+    if not question:
+        raise ValueError("Question is empty")
+    blocks = get_blocks(doc_id)
+    if not blocks:
+        raise ValueError("Document blocks are not ready")
+    context = build_summary_context(blocks)[:CHAT_CONTEXT_CHARS]
+    summary = get_summary(doc_id)
+    try:
+        meta = ensure_metadata(doc_id)
+    except Exception:
+        meta = {}
+    result = call_deepseek([
+        {
+            "role": "system",
+            "content": (
+                "你是论文阅读问答助手。请用中文回答用户关于这篇论文的问题，优先依据提供的正文、译文、图表标题、公式和本地摘要。"
+                "如果材料中没有答案，直接说明没有在当前论文内容中找到可靠依据。涉及公式时使用可由 MathJax 编译的 LaTeX。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "论文元数据：\n"
+                + json.dumps(meta, ensure_ascii=False)
+                + "\n\n本地摘要：\n"
+                + (summary[:6000] if summary else "暂无")
+                + "\n\n论文内容：\n"
+                + context
+                + "\n\n问题：\n"
+                + question
+            ),
+        },
+    ], max_tokens=2600)
+    return result.strip()
 
 
 def loading_page(title, doc_id, source_path):
@@ -1182,6 +1397,33 @@ figcaption {{
   border-top: 1px solid var(--line);
   margin: 12px 0;
 }}
+.chat-box {{
+  display: grid;
+  gap: 8px;
+  padding: 0 14px 14px;
+}}
+.chat-box[hidden] {{
+  display: none;
+}}
+.chat-box textarea {{
+  width: 100%;
+  min-height: 86px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 11px;
+  font: 14px/1.6 "Microsoft YaHei", "Segoe UI", sans-serif;
+}}
+.chat-actions {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}}
+.chat-hint {{
+  color: var(--muted);
+  font-size: 12px;
+}}
 @media (max-width: 760px) {{
   body {{ font-size: 15px; }}
   .topbar {{ flex-wrap: wrap; }}
@@ -1197,6 +1439,7 @@ figcaption {{
 <div class="topbar">
   <div class="brand">Z</div>
   <button class="primary" onclick="summarize()">DeepSeek 摘要</button>
+  <button onclick="openChat()">DeepSeek 问答</button>
   <div class="source" title="{escaped_path}">{escaped_path}</div>
   <button id="fullscreenBtn" class="fullscreen-toggle" onclick="toggleFullscreen()" title="全屏阅读">⛶ 全屏阅读</button>
 </div>
@@ -1206,6 +1449,13 @@ figcaption {{
 <div id="ai" class="ai-panel empty">
   <div class="ai-head"><strong id="aiTitle">DeepSeek</strong><button class="ai-close" onclick="closeAI()" title="关闭">×</button></div>
   <div id="aiBody" class="ai-body"></div>
+  <div id="chatBox" class="chat-box" hidden>
+    <textarea id="chatInput" placeholder="询问这篇论文的方法、实验、公式、局限或某张图表..."></textarea>
+    <div class="chat-actions">
+      <span class="chat-hint">Ctrl+Enter 发送</span>
+      <button id="chatSend" class="primary" onclick="askDeepSeek()">发送</button>
+    </div>
+  </div>
 </div>
 <script>
 window.MathJax = {{
@@ -1220,6 +1470,9 @@ const assets = {json.dumps(assets, ensure_ascii=False)};
 const ai = document.getElementById('ai');
 const aiTitle = document.getElementById('aiTitle');
 const aiBody = document.getElementById('aiBody');
+const chatBox = document.getElementById('chatBox');
+const chatInput = document.getElementById('chatInput');
+const chatSend = document.getElementById('chatSend');
 
 function escapeHTML(text) {{
   return String(text || '')
@@ -1271,17 +1524,28 @@ function typesetAI() {{
   }}
 }}
 
-function showAI(text, title = 'DeepSeek') {{
+function showAI(text, title = 'DeepSeek', options = {{}}) {{
+  const chat = !!options.chat;
   aiTitle.textContent = title;
   aiBody.innerHTML = markdownToHTML(text || '');
-  ai.classList.toggle('empty', !text);
+  if (chatBox) {{
+    chatBox.hidden = !chat;
+  }}
+  ai.classList.toggle('empty', !text && !chat);
   if (text) {{
     setTimeout(typesetAI, 0);
+  }}
+  if (chat && chatInput) {{
+    setTimeout(() => chatInput.focus(), 0);
   }}
 }}
 
 function closeAI() {{
-  showAI('');
+  showAI('', 'DeepSeek', {{ chat: false }});
+}}
+
+function openChat() {{
+  showAI('可以直接询问这篇论文的核心方法、实验结论、公式含义、图表内容或局限性。回答会基于本地解析和已缓存的译文。', 'DeepSeek 问答', {{ chat: true }});
 }}
 
 function nativeFullscreenElement() {{
@@ -1374,6 +1638,40 @@ async function summarize() {{
   showAI(text, 'DeepSeek 摘要');
 }}
 
+async function askDeepSeek() {{
+  const question = (chatInput && chatInput.value || '').trim();
+  if (!question) {{
+    return;
+  }}
+  chatSend.disabled = true;
+  showAI('DeepSeek 正在结合本地解析正文和译文回答...', 'DeepSeek 问答', {{ chat: true }});
+  try {{
+    const r = await fetch('/api/chat', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ id: docID, question }})
+    }});
+    const data = await r.json();
+    const answer = data.error || data.text || '没有返回内容';
+    showAI('**问题：** ' + question + '\\n\\n' + answer, 'DeepSeek 问答', {{ chat: true }});
+  }}
+  catch (err) {{
+    showAI('请求失败：' + err, 'DeepSeek 问答', {{ chat: true }});
+  }}
+  finally {{
+    chatSend.disabled = false;
+  }}
+}}
+
+if (chatInput) {{
+  chatInput.addEventListener('keydown', (event) => {{
+    if (event.key === 'Enter' && event.ctrlKey) {{
+      event.preventDefault();
+      askDeepSeek();
+    }}
+  }});
+}}
+
 async function explainAsset(kind, index) {{
   showAI('DeepSeek 正在解读图表...', 'AI 解释');
   const r = await fetch('/api/explain-asset', {{
@@ -1447,6 +1745,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, get_blocks(qs.get("id", [""])[0]))
             if parsed.path == "/api/translation":
                 return self.send_text(200, get_article(qs.get("id", [""])[0]))
+            if parsed.path == "/api/metadata":
+                doc_id = qs.get("id", [""])[0]
+                force = qs.get("force", ["0"])[0] == "1"
+                cache_path = doc_dir(doc_id) / "metadata.json"
+                cached = None if force else read_json(cache_path, None)
+                if cached:
+                    return self.send_json(200, cached)
+                status = get_status(doc_id)
+                job = JOBS.get(doc_id)
+                if job and not job.done() and not get_blocks(doc_id):
+                    return self.send_json(202, {"status": status.get("status"), "stage": status.get("stage"), "progress": status.get("progress", 0)})
+                meta = ensure_metadata(doc_id, force=force)
+                return self.send_json(200, meta)
             if parsed.path.startswith("/cache/"):
                 return self.serve_cache(parsed.path)
             if parsed.path.startswith("/static/mathjax/"):
@@ -1498,6 +1809,11 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     {"role": "user", "content": content[:12000]},
                 ], max_tokens=1600)
+                return self.send_json(200, {"text": result})
+            if parsed.path == "/api/chat":
+                doc_id = str(data.get("id", ""))
+                question = str(data.get("question", ""))
+                result = answer_paper_question(doc_id, question)
                 return self.send_json(200, {"text": result})
             return self.send_text(404, "Not found", "text/plain; charset=utf-8")
         except Exception as exc:
