@@ -187,6 +187,7 @@ def config_status():
     config = get_config()
     webdav_url = config.get("WEBDAV_URL") or os.environ.get("WEBDAV_URL", "https://dav.jianguoyun.com/dav/")
     webdav_user = config.get("WEBDAV_USERNAME") or os.environ.get("WEBDAV_USERNAME", "")
+    account_name = config.get("SCIREADER_ACCOUNT_NAME") or webdav_user
     return {
         "deepseekConfigured": bool(get_secret("DEEPSEEK_API_KEY")),
         "easyScholarConfigured": bool(get_secret("EASYSCHOLAR_SECRET_KEY", ("EASYSCHOLAR_SECRETKEY", "EASYSCHOLAR_KEY"))),
@@ -194,6 +195,8 @@ def config_status():
         "webdavConfigured": bool(webdav_url and webdav_user and get_secret("WEBDAV_PASSWORD", ("WEBDAV_APP_PASSWORD",))),
         "webdavUrl": webdav_url,
         "webdavUser": webdav_user,
+        "accountConfigured": bool(account_name and webdav_url and webdav_user and get_secret("WEBDAV_PASSWORD", ("WEBDAV_APP_PASSWORD",))),
+        "accountName": account_name,
     }
 
 
@@ -265,6 +268,49 @@ def webdav_put_file(config, remote_parts, path):
         return getattr(resp, "status", 200)
 
 
+def webdav_put_json(config, remote_parts, obj):
+    data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+    with webdav_request(config, "PUT", remote_parts, data=data, content_type="application/json; charset=utf-8", timeout=120) as resp:
+        return getattr(resp, "status", 200)
+
+
+def webdav_get_bytes(config, remote_parts):
+    with webdav_request(config, "GET", remote_parts, timeout=180) as resp:
+        return resp.read()
+
+
+def webdav_get_json(config, remote_parts):
+    return json.loads(webdav_get_bytes(config, remote_parts).decode("utf-8-sig"))
+
+
+def webdav_download_file(config, remote_parts, local_path):
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(webdav_get_bytes(config, remote_parts))
+    return local_path
+
+
+def cloud_account_payload(config, account_name):
+    account_name = compact_text(account_name) or config["user"]
+    account_id = hashlib.sha256(f"{config['url']}|{config['user']}|{account_name}".encode("utf-8")).hexdigest()[:16]
+    return {
+        "app": "SciReader",
+        "accountName": account_name,
+        "accountID": account_id,
+        "webdavUser": config["user"],
+        "updated": now(),
+    }
+
+
+def ensure_cloud_account(account_name=None):
+    config = webdav_config()
+    account_name = compact_text(account_name or get_config().get("SCIREADER_ACCOUNT_NAME") or config["user"])
+    webdav_mkcol(config, [WEBDAV_ROOT])
+    payload = cloud_account_payload(config, account_name)
+    webdav_put_json(config, [WEBDAV_ROOT, "account.json"], payload)
+    return payload
+
+
 def iter_cache_files(doc_id):
     target = doc_dir(doc_id)
     if not target.exists():
@@ -290,6 +336,7 @@ def sync_items_to_webdav(items):
 
         webdav_mkcol(config, [WEBDAV_ROOT, "ai", doc_id])
         cache_files = iter_cache_files(doc_id)
+        cache_entries = []
         for file_path in cache_files:
             rel = file_path.relative_to(doc_dir(doc_id))
             remote_parts = [WEBDAV_ROOT, "ai", doc_id]
@@ -298,11 +345,19 @@ def sync_items_to_webdav(items):
                 webdav_mkcol(config, remote_parts)
             remote_parts.append(safe_remote_name(rel.name, "file"))
             webdav_put_file(config, remote_parts, file_path)
+            cache_entries.append("/".join(rel.parts))
             uploaded += 1
-        synced_docs.append({"id": doc_id, "title": title, "files": 1 + len(cache_files)})
+        synced_docs.append({
+            "id": doc_id,
+            "title": title,
+            "pdfRemote": pdf_name,
+            "files": 1 + len(cache_files),
+            "cacheFiles": cache_entries,
+        })
 
     manifest = {
         "app": "SciReader",
+        "accountName": get_config().get("SCIREADER_ACCOUNT_NAME") or config["user"],
         "updated": now(),
         "documents": synced_docs,
     }
@@ -313,6 +368,60 @@ def sync_items_to_webdav(items):
     )
     uploaded += 1
     return {"ok": True, "uploaded": uploaded, "documents": len(synced_docs)}
+
+
+def safe_relative_parts(rel):
+    parts = []
+    for part in Path(str(rel)).parts:
+        if part in {"", ".", ".."}:
+            return []
+        parts.append(safe_remote_name(part, "file"))
+    return parts
+
+
+def pull_items_from_webdav():
+    config = webdav_config()
+    manifest = webdav_get_json(config, [WEBDAV_ROOT, "manifest.json"])
+    downloads_dir = CACHE_ROOT / "cloud-downloads"
+    pulled = []
+    downloaded = 0
+    for doc in manifest.get("documents", []):
+        doc_id = compact_text(doc.get("id"))
+        if not doc_id:
+            continue
+        title = safe_remote_name(doc.get("title") or doc_id, doc_id)
+        pdf_remote = compact_text(doc.get("pdfRemote"))
+        pdf_path = ""
+        if pdf_remote:
+            pdf_path = str(webdav_download_file(
+                config,
+                [WEBDAV_ROOT, "pdfs", pdf_remote],
+                downloads_dir / f"{title} - {doc_id}.pdf",
+            ))
+            downloaded += 1
+        restored_cache = 0
+        for rel in doc.get("cacheFiles") or []:
+            rel_parts = safe_relative_parts(rel)
+            if not rel_parts:
+                continue
+            local_path = doc_dir(doc_id)
+            for part in rel_parts:
+                local_path = local_path / part
+            webdav_download_file(config, [WEBDAV_ROOT, "ai", doc_id, *rel_parts], local_path)
+            restored_cache += 1
+            downloaded += 1
+        pulled.append({
+            "id": doc_id,
+            "title": title,
+            "pdfPath": pdf_path,
+            "cacheFiles": restored_cache,
+        })
+    return {
+        "ok": True,
+        "downloaded": downloaded,
+        "documents": pulled,
+        "accountName": manifest.get("accountName", ""),
+    }
 
 
 def write_temp_json(obj):
@@ -2038,6 +2147,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True, "time": now()})
             if parsed.path == "/api/config":
                 return self.send_json(200, config_status())
+            if parsed.path == "/api/account":
+                return self.send_json(200, config_status())
             if parsed.path == "/api/ingest":
                 path = safe_pdf_path(qs.get("path", [""])[0])
                 title = qs.get("title", [path.name])[0]
@@ -2156,6 +2267,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("items must be a list")
                 result = sync_items_to_webdav(items)
                 return self.send_json(200, result)
+            if parsed.path == "/api/sync/pull":
+                result = pull_items_from_webdav()
+                return self.send_json(200, result)
+            if parsed.path == "/api/account":
+                updates = {}
+                if data.get("accountName"):
+                    updates["SCIREADER_ACCOUNT_NAME"] = data.get("accountName")
+                if data.get("webdavUrl"):
+                    updates["WEBDAV_URL"] = data.get("webdavUrl")
+                if data.get("webdavUser"):
+                    updates["WEBDAV_USERNAME"] = data.get("webdavUser")
+                if data.get("webdavPassword"):
+                    updates["WEBDAV_PASSWORD"] = data.get("webdavPassword")
+                save_config(updates)
+                account = ensure_cloud_account(data.get("accountName"))
+                status = config_status()
+                status["cloudAccount"] = account
+                return self.send_json(200, status)
             if parsed.path == "/api/config":
                 updates = {}
                 if data.get("deepseekKey"):

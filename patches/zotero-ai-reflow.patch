@@ -125,7 +125,7 @@ index ad96024..cb3aec5 100755
          # Delete styles build script
          os.remove(os.path.join(tmp_src_dir, 'styles', 'update'))
 diff --git a/chrome/content/zotero/standalone/standalone.js b/chrome/content/zotero/standalone/standalone.js
-index a7723e9..8a74e95 100644
+index a7723e9..b8771bd 100644
 --- a/chrome/content/zotero/standalone/standalone.js
 +++ b/chrome/content/zotero/standalone/standalone.js
 @@ -523,6 +523,11 @@ const ZoteroStandalone = new function () {
@@ -140,7 +140,7 @@ index a7723e9..8a74e95 100644
  		this.onUpdateCustomMenus(event, 'view');
  	};
  
-@@ -661,6 +666,30 @@ const ZoteroStandalone = new function () {
+@@ -661,6 +666,42 @@ const ZoteroStandalone = new function () {
  			case 'hide-context-annotation-rows':
  				this.toggleBooleanPref('hideContextAnnotationRows');
  				break;
@@ -157,6 +157,12 @@ index a7723e9..8a74e95 100644
 +				}
 +				break;
 +
++			case 'ai-reflow-account':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.configureAccount();
++				}
++				break;
++
 +			case 'ai-reflow-stars':
 +				if (Zotero.AIReflow) {
 +					Zotero.AIReflow.promptSetStars();
@@ -168,15 +174,21 @@ index a7723e9..8a74e95 100644
 +					Zotero.AIReflow.syncLibrary();
 +				}
 +				break;
++
++			case 'ai-reflow-restore':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.restoreLibrary();
++				}
++				break;
  		}
  	};
  	
 diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
 new file mode 100644
-index 0000000..00060f5
+index 0000000..da91e4a
 --- /dev/null
 +++ b/chrome/content/zotero/xpcom/aiReflow.js
-@@ -0,0 +1,1235 @@
+@@ -0,0 +1,1374 @@
 +/*
 +    Local SciReader bridge for PDF attachments.
 +*/
@@ -310,6 +322,81 @@ index 0000000..00060f5
 +	};
 +
 +	this.configureKeys = this.configureSettings;
++
++	this.configureAccount = async function () {
++		let status = {};
++		try {
++			status = await this.jsonRequest(`${this.baseURL}/api/account`, { timeout: 10000 });
++		}
++		catch (e) {}
++		let accountName = { value: status.accountName || status.webdavUser || '' };
++		let webdavURL = { value: status.webdavUrl || 'https://dav.jianguoyun.com/dav/' };
++		let webdavUser = { value: status.webdavUser || '' };
++		let webdavPassword = { value: '' };
++		let check = { value: false };
++		let ok = Services.prompt.prompt(
++			null,
++			'SciReader 账户',
++			'账户名称（用于跨设备识别，可填邮箱或昵称）：',
++			accountName,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.prompt(
++			null,
++			'SciReader 账户',
++			'WebDAV 服务器地址：',
++			webdavURL,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.prompt(
++			null,
++			'SciReader 账户',
++			'WebDAV 账号：',
++			webdavUser,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		ok = Services.prompt.promptPassword(
++			null,
++			'SciReader 账户',
++			'WebDAV 应用密码（第一次登录必填，留空则沿用本机已保存密码）：',
++			webdavPassword,
++			'',
++			check
++		);
++		if (!ok) {
++			return;
++		}
++		try {
++			let response = await this.postJSON('/api/account', {
++				accountName: accountName.value,
++				webdavUrl: webdavURL.value,
++				webdavUser: webdavUser.value,
++				webdavPassword: webdavPassword.value
++			}, { timeout: 60000 });
++			let message = `账户：${response.accountName || accountName.value || '未命名'}\n`
++				+ `WebDAV：${response.webdavConfigured ? '已登录' : '未登录'}\n`
++				+ '云端账户文件已创建/更新。';
++			Services.prompt.alert(null, 'SciReader 账户', message);
++			if (response.webdavConfigured && Services.prompt.confirm(null, 'SciReader 云恢复', '是否现在从云端拉取 PDF 和 AI 阅读缓存到本机？')) {
++				await this.restoreLibrary({ skipConfirm: true });
++			}
++		}
++		catch (e) {
++			Services.prompt.alert(null, 'SciReader 账户失败', String(e));
++		}
++	};
 +
 +	this.closeProgressTask = function (docID) {
 +		let task = this._progressTasks.get(docID);
@@ -953,7 +1040,11 @@ index 0000000..00060f5
 +		}
 +		let data = this.parseAIExtra(target);
 +		let stars = this.normalizeStars(data.Stars);
-+		return this.sortCellData(stars, `${stars}星 ${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}`);
++		return this.sortCellData(stars, [
++			target.id,
++			stars,
++			`${stars}星 ${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}`
++		].join('\t'));
 +	};
 +
 +	this.codeColumnData = function (item) {
@@ -1209,20 +1300,84 @@ index 0000000..00060f5
 +		}
 +	};
 +
-+	this.renderStarsCell = function (index, data, column, doc = document, rowItem = null) {
++	this.pathBasename = function (path) {
++		return String(path || '').split(/[\\/]/).pop();
++	};
++
++	this.restoreLibrary = async function (options = {}) {
++		try {
++			if (!options.skipConfirm) {
++				let confirm = Services.prompt.confirm(
++					null,
++					'SciReader 云恢复',
++					'将从 WebDAV 拉取 PDF 和 AI 阅读缓存，并把缺失的 PDF 导入本地文献库。是否继续？'
++				);
++				if (!confirm) {
++					return;
++				}
++			}
++			let result = await this.postJSON('/api/sync/pull', {}, { timeout: 900000 });
++			if (result.error) {
++				Services.prompt.alert(null, 'SciReader 云恢复失败', result.error);
++				return;
++			}
++			let existing = await this.collectPDFItems();
++			let existingNames = new Set(existing.map(item => this.pathBasename(item.path).toLowerCase()));
++			let imported = 0;
++			let skipped = 0;
++			for (let doc of result.documents || []) {
++				if (!doc.pdfPath) {
++					continue;
++				}
++				let basename = this.pathBasename(doc.pdfPath).toLowerCase();
++				if (existingNames.has(basename)) {
++					skipped++;
++					continue;
++				}
++				let attachment = await Zotero.Attachments.importFromFile({
++					file: doc.pdfPath,
++					libraryID: Zotero.Libraries.userLibraryID,
++					title: 'Full Text PDF'
++				});
++				existingNames.add(basename);
++				imported++;
++				try {
++					await this.ensureParentItem(attachment, { title: doc.title, path: doc.pdfPath });
++					await this.updateParentFromMetadata(attachment, doc.pdfPath, doc.id, null);
++				}
++				catch (e) {
++					Zotero.debug(`SciReader cloud restore metadata update failed: ${e}`);
++				}
++			}
++			Services.prompt.alert(
++				null,
++				'SciReader 云恢复完成',
++				`云端论文 ${result.documents?.length || 0} 篇，下载文件 ${result.downloaded || 0} 个，新导入 ${imported} 个 PDF，跳过 ${skipped} 个已存在 PDF。`
++			);
++		}
++		catch (e) {
++			Services.prompt.alert(null, 'SciReader 云恢复失败', String(e));
++		}
++	};
++
++	this.renderStarsCell = function (index, data, column, doc = document) {
 +		let cell = doc.createElement('span');
 +		cell.className = `cell ${column.className}`;
 +		cell.style.cssText = 'display:inline-flex;align-items:center;gap:1px;white-space:nowrap;';
 +		data = this.displayCellData(data);
-+		let target = this.getColumnItem(rowItem);
-+		if (!data || !target) {
++		if (!data) {
 +			return cell;
 +		}
-+		let stars = Math.max(0, Math.min(5, (String(data).match(/★/g) || []).length));
++		let [targetID, starValue] = String(data).split('\t');
++		targetID = parseInt(targetID, 10);
++		let stars = this.normalizeStars(starValue);
++		if (!targetID) {
++			return cell;
++		}
 +		for (let i = 1; i <= 5; i++) {
 +			let star = doc.createElement('span');
 +			star.textContent = i <= stars ? '★' : '☆';
-+			star.title = `${i} 星`;
++			star.title = `${i} 星（Ctrl+点击清零）`;
 +			star.setAttribute('role', 'button');
 +			star.tabIndex = 0;
 +			star.style.cssText = [
@@ -1238,7 +1393,8 @@ index 0000000..00060f5
 +				if (event.stopImmediatePropagation) {
 +					event.stopImmediatePropagation();
 +				}
-+				this.setStars(target.id, i).catch(e => Zotero.debug(`AI Reflow star update failed: ${e}`));
++				let nextStars = event.ctrlKey ? 0 : i;
++				this.setStars(targetID, nextStars).catch(e => Zotero.debug(`AI Reflow star update failed: ${e}`));
 +			};
 +			star.addEventListener('mousedown', applyStar, true);
 +			star.addEventListener('click', applyStar, true);
@@ -1301,12 +1457,7 @@ index 0000000..00060f5
 +				minWidth: 84,
 +				dataProvider: (item) => this.starsColumnData(item),
 +				renderCell: function (index, data, column, _isFirstColumn, doc) {
-+					let rowItem = null;
-+					try {
-+						rowItem = this.getRow(index)?.ref;
-+					}
-+					catch (e) {}
-+					return Zotero.AIReflow.renderStarsCell(index, data, column, doc, rowItem);
++					return Zotero.AIReflow.renderStarsCell(index, data, column, doc);
 +				},
 +				zoteroPersist: ['width', 'hidden', 'sortDirection']
 +			});
@@ -1887,10 +2038,10 @@ index 5fc0dc7..6bcfeb9 100644
  
  
 diff --git a/chrome/content/zotero/zoteroPane.xhtml b/chrome/content/zotero/zoteroPane.xhtml
-index 62de138..4b62f7c 100644
+index 62de138..916c64e 100644
 --- a/chrome/content/zotero/zoteroPane.xhtml
 +++ b/chrome/content/zotero/zoteroPane.xhtml
-@@ -702,6 +702,27 @@
+@@ -702,6 +702,37 @@
  								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
  								type="checkbox"
  							/>
@@ -1905,6 +2056,11 @@ index 62de138..4b62f7c 100644
 +								label="SciReader 设置"
 +								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +							/>
++							<menuitem id="view-menuitem-ai-reflow-account"
++								class="menu-type-library"
++								label="SciReader 账户登录/注册"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++							/>
 +							<menuitem id="view-menuitem-ai-reflow-stars"
 +								class="menu-type-library"
 +								label="SciReader 设置重要性"
@@ -1915,10 +2071,15 @@ index 62de138..4b62f7c 100644
 +								label="SciReader 云同步"
 +								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +							/>
++							<menuitem id="view-menuitem-ai-reflow-restore"
++								class="menu-type-library"
++								label="SciReader 云恢复"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++							/>
  							<menuseparator/>
  							<menuitem id="show-tabs-menu"
  								data-l10n-id="menu-show-tabs-menu"
-@@ -910,12 +931,12 @@
+@@ -910,12 +941,12 @@
  				buttons[0].focus();
  			}" />
  			
@@ -1935,7 +2096,7 @@ index 62de138..4b62f7c 100644
  						noautohide="true">
  					<label id="zotero-tb-sync-label"/>
  					<label id="zotero-tb-sync-status" class="sync-button-tooltip-status" hidden="true"/>
-@@ -1351,6 +1372,34 @@
+@@ -1351,6 +1382,52 @@
  														/>
  													</menupopup>
  												</toolbarbutton>
@@ -1950,6 +2111,15 @@ index 62de138..4b62f7c 100644
 +													oncommand="Zotero.AIReflow?.configureSettings()"
 +												/>
 +												<toolbarbutton
++													id="scireader-tb-account"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="账户"
++													tooltiptext="登录或注册 SciReader WebDAV 云账户"
++													style="padding: 0 9px; min-width: 54px;"
++													oncommand="Zotero.AIReflow?.configureAccount()"
++												/>
++												<toolbarbutton
 +													id="scireader-tb-sync"
 +													class="zotero-tb-button"
 +													tabindex="-1"
@@ -1957,6 +2127,15 @@ index 62de138..4b62f7c 100644
 +													tooltiptext="同步 PDF 和 AI 阅读文件到 WebDAV"
 +													style="padding: 0 9px; min-width: 54px;"
 +													oncommand="Zotero.AIReflow?.syncLibrary()"
++												/>
++												<toolbarbutton
++													id="scireader-tb-restore"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="云恢复"
++													tooltiptext="从 WebDAV 拉取 PDF 和 AI 阅读文件"
++													style="padding: 0 9px; min-width: 66px;"
++													oncommand="Zotero.AIReflow?.restoreLibrary()"
 +												/>
 +												<toolbarbutton
 +													id="scireader-tb-stars"
