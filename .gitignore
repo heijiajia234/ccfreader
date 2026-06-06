@@ -3,6 +3,10 @@ reflow-service/.env
 reflow-service/node_modules/
 reflow-service/__pycache__/
 reflow-service/*.log
+apps/scireader-desktop/node_modules/
+apps/scireader-desktop/dist/
+apps/scireader-desktop/out/
+apps/scireader-desktop/.vite/
 tools/
 zotero-dev-profile/
 zotero-upstream/

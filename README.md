@@ -8,6 +8,8 @@ Local Zotero AI Reflow build for Windows.
 - `patches/zotero-ai-reflow.patch`: Zotero source changes that replace the native PDF reader entry point with the local AI Reflow reader and add background progress tracking.
 - `build-zotero-dev.cmd`: Windows helper for building the patched Zotero source in this workspace.
 - `run-zotero-dev.cmd`: starts the local reflow service if needed, then launches the built Zotero app with a local dev profile.
+- `apps/scireader-desktop/`: new Electron + React + TypeScript SciReader desktop shell. It reads Zotero storage into `reflow-cache/scireader.sqlite`, talks to the same local reflow service, and provides the cleaner research workspace UI.
+- `run-scireader-desktop.cmd`: launches the Electron SciReader desktop app.
 
 ## Secrets
 
