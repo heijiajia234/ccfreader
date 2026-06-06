@@ -124,8 +124,51 @@ index ad96024..cb3aec5 100755
          
          # Delete styles build script
          os.remove(os.path.join(tmp_src_dir, 'styles', 'update'))
+diff --git a/chrome/content/zotero/elements/itemDetails.js b/chrome/content/zotero/elements/itemDetails.js
+index c441d40..a8d77f2 100644
+--- a/chrome/content/zotero/elements/itemDetails.js
++++ b/chrome/content/zotero/elements/itemDetails.js
+@@ -34,6 +34,7 @@
+ 			<hbox id="zotero-view-item-container" class="zotero-view-item-container" flex="1">
+ 				<html:div class="zotero-view-item-main">
+ 					<item-pane-header id="zotero-item-pane-header" />
++					<html:div id="scireader-paper-pane" class="scireader-paper-pane" hidden="true"></html:div>
+ 					
+ 					<html:div id="zotero-view-item" class="zotero-view-item" tabindex="0" data-l10n-id="item-details-pane">
+ 						<info-box id="zotero-editpane-info-box" data-pane="info"/>
+@@ -160,6 +161,7 @@
+ 		init() {
+ 			this._container = this.querySelector('#zotero-view-item-container');
+ 			this._header = this.querySelector('#zotero-item-pane-header');
++			this._sciReaderPane = this.querySelector('#scireader-paper-pane');
+ 			this._paneParent = this.querySelector('#zotero-view-item');
+ 
+ 			this._container.addEventListener("keydown", this._handleKeydown);
+@@ -222,6 +224,22 @@
+ 				this._renderPromise = new Promise(r => resolve = r);
+ 			}
+ 
++			try {
++				if (Zotero.AIReflow?.renderSciReaderItemPane?.(this, item)) {
++					this._isRendering = false;
++					if (resolve) {
++						resolve();
++					}
++					return;
++				}
++			}
++			catch (e) {
++				Zotero.debug(`SciReader item pane render failed: ${e}`);
++			}
++			this._sciReaderPane.hidden = true;
++			this._header.hidden = false;
++			this._paneParent.hidden = false;
++
+ 			this.renderCustomSections();
+ 			this._restorePinnedPane();
+ 
 diff --git a/chrome/content/zotero/standalone/standalone.js b/chrome/content/zotero/standalone/standalone.js
-index a7723e9..b8771bd 100644
+index a7723e9..30f7023 100644
 --- a/chrome/content/zotero/standalone/standalone.js
 +++ b/chrome/content/zotero/standalone/standalone.js
 @@ -523,6 +523,11 @@ const ZoteroStandalone = new function () {
@@ -140,7 +183,7 @@ index a7723e9..b8771bd 100644
  		this.onUpdateCustomMenus(event, 'view');
  	};
  
-@@ -661,6 +666,42 @@ const ZoteroStandalone = new function () {
+@@ -661,6 +666,54 @@ const ZoteroStandalone = new function () {
  			case 'hide-context-annotation-rows':
  				this.toggleBooleanPref('hideContextAnnotationRows');
  				break;
@@ -169,6 +212,18 @@ index a7723e9..b8771bd 100644
 +				}
 +				break;
 +
++			case 'ai-reflow-recommend':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.openSelectedRecommendationWorkbench();
++				}
++				break;
++
++			case 'ai-reflow-skills':
++				if (Zotero.AIReflow) {
++					Zotero.AIReflow.openSelectedSkillWorkbench();
++				}
++				break;
++
 +			case 'ai-reflow-sync':
 +				if (Zotero.AIReflow) {
 +					Zotero.AIReflow.syncLibrary();
@@ -185,10 +240,10 @@ index a7723e9..b8771bd 100644
  	
 diff --git a/chrome/content/zotero/xpcom/aiReflow.js b/chrome/content/zotero/xpcom/aiReflow.js
 new file mode 100644
-index 0000000..da91e4a
+index 0000000..12e8682
 --- /dev/null
 +++ b/chrome/content/zotero/xpcom/aiReflow.js
-@@ -0,0 +1,1374 @@
+@@ -0,0 +1,1837 @@
 +/*
 +    Local SciReader bridge for PDF attachments.
 +*/
@@ -1360,6 +1415,468 @@ index 0000000..da91e4a
 +		}
 +	};
 +
++	this.htmlElement = function (doc, tag, className = '', text = '') {
++		let el = doc.createElementNS('http://www.w3.org/1999/xhtml', tag);
++		if (className) {
++			el.className = className;
++		}
++		if (text !== '') {
++			el.textContent = text;
++		}
++		return el;
++	};
++
++	this.clearElement = function (el) {
++		while (el.firstChild) {
++			el.removeChild(el.firstChild);
++		}
++	};
++
++	this.installSciReaderShellStyles = function (doc = document) {
++		if (doc.getElementById('scireader-shell-style')) {
++			return;
++		}
++		doc.documentElement.classList.add('scireader-shell');
++		let style = doc.createElementNS('http://www.w3.org/1999/xhtml', 'style');
++		style.id = 'scireader-shell-style';
++		style.textContent = `
++			:root.scireader-shell {
++				--sr-bg: #f5f7fb;
++				--sr-card: #ffffff;
++				--sr-line: #dfe5ee;
++				--sr-text: #142033;
++				--sr-muted: #64748b;
++				--sr-blue: #2563eb;
++				--sr-green: #059669;
++				--sr-yellow: #d97706;
++				--sr-red: #dc2626;
++			}
++			.scireader-shell #zotero-pane,
++			.scireader-shell #zotero-items-pane,
++			.scireader-shell #zotero-item-pane {
++				background: var(--sr-bg) !important;
++			}
++			.scireader-shell toolbar,
++			.scireader-shell #zotero-toolbar {
++				background: #f8fafc !important;
++				border-color: var(--sr-line) !important;
++			}
++			.scireader-shell #zotero-tb-search {
++				border-radius: 7px !important;
++				border-color: var(--sr-line) !important;
++				background: #fff !important;
++			}
++			.scireader-shell #zotero-context-pane-sidenav,
++			.scireader-shell .zotero-view-item-sidenav,
++			.scireader-shell item-pane-sidenav {
++				display: none !important;
++			}
++			.scireader-shell #zotero-tag-selector,
++			.scireader-shell #zotero-tags-splitter {
++				display: none !important;
++			}
++			.scireader-shell #zotero-tb-attachment-add,
++			.scireader-shell #zotero-tb-note-add {
++				opacity: .45;
++			}
++			.scireader-shell #scireader-tb-settings,
++			.scireader-shell #scireader-tb-account,
++			.scireader-shell #scireader-tb-sync,
++			.scireader-shell #scireader-tb-restore,
++			.scireader-shell #scireader-tb-stars,
++			.scireader-shell #scireader-tb-recommend,
++			.scireader-shell #scireader-tb-skills {
++				border: 1px solid var(--sr-line) !important;
++				border-radius: 6px !important;
++				background: #fff !important;
++				color: var(--sr-text) !important;
++				margin-inline-start: 5px !important;
++				min-height: 28px !important;
++			}
++			.scireader-shell #scireader-tb-sync,
++			.scireader-shell #scireader-tb-recommend {
++				background: #eef4ff !important;
++				border-color: #bfd4ff !important;
++				color: #1d4ed8 !important;
++			}
++			.scireader-paper-pane {
++				box-sizing: border-box;
++				min-width: 330px;
++				height: 100%;
++				overflow: auto;
++				padding: 18px 18px 24px;
++				background: var(--sr-bg);
++				color: var(--sr-text);
++				font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
++			}
++			.scireader-card {
++				background: var(--sr-card);
++				border: 1px solid var(--sr-line);
++				border-radius: 8px;
++				padding: 18px;
++				box-shadow: 0 8px 28px rgba(15, 23, 42, .05);
++			}
++			.scireader-kicker {
++				color: var(--sr-muted);
++				font-size: 12px;
++				font-weight: 700;
++				letter-spacing: .04em;
++				text-transform: uppercase;
++				margin-bottom: 8px;
++			}
++			.scireader-title {
++				font-size: 18px;
++				font-weight: 760;
++				line-height: 1.35;
++				margin: 0 0 10px;
++				overflow-wrap: anywhere;
++			}
++			.scireader-authors {
++				color: var(--sr-muted);
++				font-size: 13px;
++				line-height: 1.45;
++				margin-bottom: 14px;
++			}
++			.scireader-badges {
++				display: flex;
++				flex-wrap: wrap;
++				gap: 6px;
++				margin: 10px 0 16px;
++			}
++			.scireader-badge {
++				display: inline-flex;
++				align-items: center;
++				max-width: 100%;
++				min-height: 22px;
++				border-radius: 5px;
++				padding: 0 8px;
++				font-size: 12px;
++				font-weight: 700;
++				background: #e5e7eb;
++				color: #334155;
++				overflow: hidden;
++				text-overflow: ellipsis;
++				white-space: nowrap;
++			}
++			.scireader-section {
++				border-top: 1px solid var(--sr-line);
++				padding-top: 14px;
++				margin-top: 14px;
++			}
++			.scireader-section-title {
++				font-size: 12px;
++				font-weight: 760;
++				color: var(--sr-muted);
++				margin-bottom: 8px;
++			}
++			.scireader-abstract {
++				font-size: 13px;
++				line-height: 1.65;
++				color: #263447;
++				white-space: pre-wrap;
++				max-height: 210px;
++				overflow: auto;
++			}
++			.scireader-actions {
++				display: grid;
++				grid-template-columns: repeat(2, minmax(0, 1fr));
++				gap: 8px;
++				margin-top: 14px;
++			}
++			.scireader-button {
++				border: 1px solid var(--sr-line);
++				border-radius: 6px;
++				background: #fff;
++				color: var(--sr-text);
++				padding: 8px 10px;
++				font-size: 13px;
++				font-weight: 700;
++				cursor: pointer;
++				text-align: center;
++				min-width: 0;
++			}
++			.scireader-button.primary {
++				background: var(--sr-blue);
++				border-color: var(--sr-blue);
++				color: #fff;
++			}
++			.scireader-attachments {
++				display: flex;
++				flex-direction: column;
++				gap: 7px;
++			}
++			.scireader-attachment {
++				display: flex;
++				justify-content: space-between;
++				align-items: center;
++				gap: 8px;
++				border: 1px solid #e8edf5;
++				border-radius: 6px;
++				padding: 8px 9px;
++				background: #fbfdff;
++				font-size: 12px;
++				min-width: 0;
++			}
++			.scireader-attachment > span:first-child {
++				min-width: 0;
++				overflow: hidden;
++				text-overflow: ellipsis;
++				white-space: nowrap;
++			}
++			.scireader-link {
++				color: var(--sr-blue);
++				cursor: pointer;
++				font-weight: 700;
++				white-space: nowrap;
++			}
++			.scireader-stars {
++				display: inline-flex;
++				gap: 2px;
++				margin-left: 6px;
++			}
++			.scireader-star {
++				color: #f59e0b;
++				cursor: pointer;
++				font-size: 17px;
++				line-height: 1;
++			}
++			.scireader-roadmap {
++				background: #f8fafc;
++				border: 1px dashed #cbd5e1;
++				border-radius: 7px;
++				padding: 10px;
++				color: var(--sr-muted);
++				font-size: 12px;
++				line-height: 1.55;
++			}
++		`;
++		doc.documentElement.appendChild(style);
++	};
++
++	this.applySciReaderShell = function () {
++		try {
++			if (typeof document !== 'undefined' && document?.documentElement) {
++				this.installSciReaderShellStyles(document);
++			}
++		}
++		catch (e) {
++			Zotero.debug(`SciReader shell style failed: ${e}`);
++		}
++	};
++
++	this.creatorSummary = function (item) {
++		try {
++			let creators = item.getCreators?.() || [];
++			let names = creators.map(c => {
++				let first = c.firstName || '';
++				let last = c.lastName || c.name || '';
++				return `${first} ${last}`.replace(/\s+/g, ' ').trim();
++			}).filter(Boolean);
++			if (names.length > 3) {
++				return `${names.slice(0, 3).join(', ')} 等`;
++			}
++			return names.join(', ');
++		}
++		catch (e) {
++			return '';
++		}
++	};
++
++	this.getPaneTargetItem = function (item) {
++		if (!item) {
++			return null;
++		}
++		return this.getColumnItem(item) || item;
++	};
++
++	this.getAttachmentItems = function (target, selectedItem = null) {
++		let items = [];
++		if (selectedItem && this.shouldHandleItem(selectedItem)) {
++			items.push(selectedItem);
++		}
++		try {
++			for (let id of target.getAttachments?.() || []) {
++				let attachment = Zotero.Items.get(id);
++				if (attachment && !items.some(item => item.id === attachment.id)) {
++					items.push(attachment);
++				}
++			}
++		}
++		catch (e) {}
++		return items;
++	};
++
++	this.getPrimaryPDFItem = function (target, selectedItem = null) {
++		let attachments = this.getAttachmentItems(target, selectedItem);
++		return attachments.find(item => this.shouldHandleItem(item)) || null;
++	};
++
++	this.shortText = function (text, length = 900) {
++		text = String(text || '').replace(/\s+/g, ' ').trim();
++		if (text.length <= length) {
++			return text;
++		}
++		return text.slice(0, length - 1).trim() + '…';
++	};
++
++	this.badgeElement = function (doc, text) {
++		let badge = this.htmlElement(doc, 'span', 'scireader-badge', text);
++		let style = this.badgeStyle(text);
++		badge.style.background = style.background;
++		badge.style.color = style.color;
++		return badge;
++	};
++
++	this.renderInlineStars = function (doc, item, stars) {
++		let box = this.htmlElement(doc, 'span', 'scireader-stars');
++		for (let i = 1; i <= 5; i++) {
++			let star = this.htmlElement(doc, 'span', 'scireader-star', i <= stars ? '★' : '☆');
++			star.title = `${i} 星（Ctrl+点击清零）`;
++			star.addEventListener('click', async (event) => {
++				event.preventDefault();
++				event.stopPropagation();
++				await this.setStars(item.id, event.ctrlKey ? 0 : i);
++			});
++			box.append(star);
++		}
++		return box;
++	};
++
++	this.renderSciReaderItemPane = function (itemDetails, selectedItem) {
++		let pane = itemDetails?._sciReaderPane;
++		let original = itemDetails?._paneParent;
++		let header = itemDetails?._header;
++		if (!pane || !original || !selectedItem || selectedItem.isNote?.() || selectedItem.isAnnotation?.()) {
++			return false;
++		}
++		let target = this.getPaneTargetItem(selectedItem);
++		if (!target?.isRegularItem?.() && !this.shouldHandleItem(selectedItem)) {
++			return false;
++		}
++
++		let doc = pane.ownerDocument;
++		this.installSciReaderShellStyles(doc);
++		this.clearElement(pane);
++		pane.hidden = false;
++		original.hidden = true;
++		header.hidden = true;
++
++		let data = this.parseAIExtra(target);
++		let title = target.getField?.('title') || this.getTitle(selectedItem, '') || 'Untitled Paper';
++		let authors = this.creatorSummary(target);
++		let abstractText = this.shortText(target.getField?.('abstractNote') || '暂无摘要。等待元数据识别或 DeepSeek 摘要生成后，这里会显示更完整的论文概览。');
++		let score = this.rankScore(data);
++		let grade = score >= 6 ? 'A档' : score >= 4 ? 'B档' : score >= 2 ? 'C档' : score >= 1 ? 'D档' : '未知';
++		let stars = this.normalizeStars(data.Stars);
++		let primaryPDF = this.getPrimaryPDFItem(target, selectedItem);
++		let attachments = this.getAttachmentItems(target, selectedItem);
++
++		let card = this.htmlElement(doc, 'section', 'scireader-card');
++		card.append(this.htmlElement(doc, 'div', 'scireader-kicker', 'SciReader Paper'));
++		card.append(this.htmlElement(doc, 'h1', 'scireader-title', title));
++		if (authors) {
++			card.append(this.htmlElement(doc, 'div', 'scireader-authors', authors));
++		}
++
++		let badges = this.htmlElement(doc, 'div', 'scireader-badges');
++		if (data.Venue) badges.append(this.badgeElement(doc, data.Venue));
++		if (grade !== '未知') badges.append(this.badgeElement(doc, grade));
++		if (data.CCF && data.CCF !== '未知') badges.append(this.badgeElement(doc, `CCF-${data.CCF}`));
++		if (data.SCI && data.SCI !== '未知') badges.append(this.badgeElement(doc, `SCI-${data.SCI}`));
++		if (data.JCR && data.JCR !== '未知') badges.append(this.badgeElement(doc, `JCR-${data.JCR}`));
++		if (data.CodeStatus) badges.append(this.badgeElement(doc, data.CodeStatus));
++		let starWrap = this.htmlElement(doc, 'span', 'scireader-badge', '重要性');
++		starWrap.append(this.renderInlineStars(doc, target, stars));
++		badges.append(starWrap);
++		card.append(badges);
++
++		let actionBox = this.htmlElement(doc, 'div', 'scireader-actions');
++		let readButton = this.htmlElement(doc, 'button', 'scireader-button primary', '重排阅读');
++		readButton.addEventListener('click', async () => {
++			if (primaryPDF) {
++				await this.openItem(primaryPDF);
++			}
++			else {
++				Services.prompt.alert(null, 'SciReader', '这篇条目还没有可阅读的 PDF 附件。');
++			}
++		});
++		let summaryButton = this.htmlElement(doc, 'button', 'scireader-button', 'DeepSeek 摘要');
++		summaryButton.addEventListener('click', async () => {
++			if (primaryPDF) {
++				await this.queueItem(primaryPDF, { showProgress: true });
++				Services.prompt.alert(null, 'SciReader', '已加入本地解析和摘要队列，完成后会写入论文总结笔记。');
++			}
++		});
++		let recommendButton = this.htmlElement(doc, 'button', 'scireader-button', '推荐相关论文');
++		recommendButton.addEventListener('click', () => this.openRecommendationWorkbench(target));
++		let skillButton = this.htmlElement(doc, 'button', 'scireader-button', '科研 Skill');
++		skillButton.addEventListener('click', () => this.openSkillWorkbench(target));
++		actionBox.append(readButton, summaryButton, recommendButton, skillButton);
++		card.append(actionBox);
++
++		let metaSection = this.htmlElement(doc, 'section', 'scireader-section');
++		metaSection.append(this.htmlElement(doc, 'div', 'scireader-section-title', '摘要'));
++		metaSection.append(this.htmlElement(doc, 'div', 'scireader-abstract', abstractText));
++		card.append(metaSection);
++
++		let attachmentsSection = this.htmlElement(doc, 'section', 'scireader-section');
++		attachmentsSection.append(this.htmlElement(doc, 'div', 'scireader-section-title', `附件 ${attachments.length}`));
++		let list = this.htmlElement(doc, 'div', 'scireader-attachments');
++		for (let attachment of attachments.slice(0, 5)) {
++			let row = this.htmlElement(doc, 'div', 'scireader-attachment');
++			let name = attachment.getField?.('title') || attachment.attachmentFilename || 'Attachment';
++			row.append(this.htmlElement(doc, 'span', '', this.shortText(name, 72)));
++			if (this.shouldHandleItem(attachment)) {
++				let open = this.htmlElement(doc, 'span', 'scireader-link', '打开');
++				open.addEventListener('click', async () => this.openItem(attachment));
++				row.append(open);
++			}
++			list.append(row);
++		}
++		if (!attachments.length) {
++			list.append(this.htmlElement(doc, 'div', 'scireader-attachment', '暂无附件。拖入 PDF 后会自动解析、翻译并同步。'));
++		}
++		attachmentsSection.append(list);
++		card.append(attachmentsSection);
++
++		let roadmap = this.htmlElement(doc, 'section', 'scireader-section');
++		roadmap.append(this.htmlElement(doc, 'div', 'scireader-section-title', '研究工作台'));
++		roadmap.append(this.htmlElement(doc, 'div', 'scireader-roadmap', '已预留分类推荐论文和科研 Skill 工作流入口。后续可以基于当前分类、论文等级、摘要和引用主题生成候选阅读列表。'));
++		card.append(roadmap);
++		pane.append(card);
++		return true;
++	};
++
++	this.openRecommendationWorkbench = function (item) {
++		let title = item?.getField?.('title') || '当前论文';
++		Services.prompt.alert(
++			null,
++			'SciReader 推荐',
++			`已预留“根据当前分类和《${title}》推荐相关论文”的入口。下一步可以接 arXiv、Semantic Scholar 或本地库相似度检索。`
++		);
++	};
++
++	this.getPrimarySelectedItem = function () {
++		return this.getSelectedColumnItems()[0] || null;
++	};
++
++	this.openSelectedRecommendationWorkbench = function () {
++		this.openRecommendationWorkbench(this.getPrimarySelectedItem());
++	};
++
++	this.openSkillWorkbench = function (item) {
++		let title = item?.getField?.('title') || '当前论文';
++		Services.prompt.alert(
++			null,
++			'SciReader 科研 Skill',
++			`已预留科研 Skill 工作台入口：可围绕《${title}》执行论文精读、Related Work 生成、实验表格解析、审稿式批判等工作流。`
++		);
++	};
++
++	this.openSelectedSkillWorkbench = function () {
++		this.openSkillWorkbench(this.getPrimarySelectedItem());
++	};
++
 +	this.renderStarsCell = function (index, data, column, doc = document) {
 +		let cell = doc.createElement('span');
 +		cell.className = `cell ${column.className}`;
@@ -1560,6 +2077,7 @@ index 0000000..da91e4a
 +		return true;
 +	};
 +
++	this.applySciReaderShell();
 +	this.disableNativeCloudSync();
 +	this.startColumnRegistration();
 +};
@@ -2038,10 +2556,10 @@ index 5fc0dc7..6bcfeb9 100644
  
  
 diff --git a/chrome/content/zotero/zoteroPane.xhtml b/chrome/content/zotero/zoteroPane.xhtml
-index 62de138..916c64e 100644
+index 62de138..2ee97a0 100644
 --- a/chrome/content/zotero/zoteroPane.xhtml
 +++ b/chrome/content/zotero/zoteroPane.xhtml
-@@ -702,6 +702,37 @@
+@@ -702,6 +702,47 @@
  								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
  								type="checkbox"
  							/>
@@ -2066,6 +2584,16 @@ index 62de138..916c64e 100644
 +								label="SciReader 设置重要性"
 +								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
 +							/>
++							<menuitem id="view-menuitem-ai-reflow-recommend"
++								class="menu-type-library"
++								label="SciReader 推荐相关论文"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++							/>
++							<menuitem id="view-menuitem-ai-reflow-skills"
++								class="menu-type-library"
++								label="SciReader 科研 Skill"
++								oncommand="ZoteroStandalone.onViewMenuItemClick(event)"
++							/>
 +							<menuitem id="view-menuitem-ai-reflow-sync"
 +								class="menu-type-library"
 +								label="SciReader 云同步"
@@ -2079,7 +2607,7 @@ index 62de138..916c64e 100644
  							<menuseparator/>
  							<menuitem id="show-tabs-menu"
  								data-l10n-id="menu-show-tabs-menu"
-@@ -910,12 +941,12 @@
+@@ -910,12 +951,12 @@
  				buttons[0].focus();
  			}" />
  			
@@ -2096,7 +2624,7 @@ index 62de138..916c64e 100644
  						noautohide="true">
  					<label id="zotero-tb-sync-label"/>
  					<label id="zotero-tb-sync-status" class="sync-button-tooltip-status" hidden="true"/>
-@@ -1351,6 +1382,52 @@
+@@ -1351,6 +1392,70 @@
  														/>
  													</menupopup>
  												</toolbarbutton>
@@ -2145,6 +2673,24 @@ index 62de138..916c64e 100644
 +													tooltiptext="给选中文章设置 0-5 星重要性"
 +													style="padding: 0 9px; min-width: 54px;"
 +													oncommand="Zotero.AIReflow?.promptSetStars()"
++												/>
++												<toolbarbutton
++													id="scireader-tb-recommend"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="推荐"
++													tooltiptext="根据当前分类和选中文章推荐相关论文"
++													style="padding: 0 9px; min-width: 54px;"
++													oncommand="Zotero.AIReflow?.openSelectedRecommendationWorkbench()"
++												/>
++												<toolbarbutton
++													id="scireader-tb-skills"
++													class="zotero-tb-button"
++													tabindex="-1"
++													label="Skill"
++													tooltiptext="打开科研 Skill 工作台入口"
++													style="padding: 0 9px; min-width: 54px;"
++													oncommand="Zotero.AIReflow?.openSelectedSkillWorkbench()"
 +												/>
  												
  												<spacer flex="1"/>
